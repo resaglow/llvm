@@ -405,6 +405,11 @@ public:
   static Expected<std::unique_ptr<IndexedInstrProfReader>>
   create(const Twine &Path);
 
+  /// Factory method to create a range of indexed readers from a vector of paths
+  /// rather than from a single path.
+  static std::vector<Expected<std::unique_ptr<IndexedInstrProfReader>>>
+  createProfReaderRange(const std::vector<Twine> &Paths);
+
   static Expected<std::unique_ptr<IndexedInstrProfReader>>
   create(std::unique_ptr<MemoryBuffer> Buffer);
 

@@ -75,6 +75,9 @@ Function *PartialInlinerImpl::unswitchFunction(Function *F) {
   BasicBlock *NonReturnBlock = nullptr;
   unsigned ReturnCount = 0;
   for (BasicBlock *BB : successors(EntryBlock)) {
+    errs() << "DISTANCE = " << std::distance(successors(EntryBlock).begin(),
+                                             successors(EntryBlock).end())
+           << "\n";
     if (isa<ReturnInst>(BB->getTerminator())) {
       ReturnBlock = BB;
       ReturnCount++;
@@ -82,7 +85,7 @@ Function *PartialInlinerImpl::unswitchFunction(Function *F) {
       NonReturnBlock = BB;
   }
 
-  if (ReturnCount != 1)
+  if (ReturnCount != 1) // FIXME AL || != 2
     return nullptr;
 
   // Clone the function, so that we can hack away on it.

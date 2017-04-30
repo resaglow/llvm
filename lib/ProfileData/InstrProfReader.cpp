@@ -78,6 +78,21 @@ IndexedInstrProfReader::create(const Twine &Path) {
   return IndexedInstrProfReader::create(std::move(BufferOrError.get()));
 }
 
+std::vector<Expected<std::unique_ptr<IndexedInstrProfReader>>>
+IndexedInstrProfReader::createProfReaderRange(const std::vector<Twine> &Paths) {
+    std::vector<Expected<std::unique_ptr<IndexedInstrProfReader>>> ProfReaders;
+    for (auto &Path : Paths) {
+        // For each path, set up a buffer to read.
+        auto CurBufferOrError = setupMemoryBuffer(Path);
+        if (Error E = CurBufferOrError.takeError()) {
+            ProfReaders.push_back(std::move(E));
+            return ProfReaders;
+        }
+        ProfReaders.push_back(IndexedInstrProfReader::create(
+          std::move(CurBufferOrError.get())));
+    }
+    return ProfReaders;
+}
 
 Expected<std::unique_ptr<IndexedInstrProfReader>>
 IndexedInstrProfReader::create(std::unique_ptr<MemoryBuffer> Buffer) {
