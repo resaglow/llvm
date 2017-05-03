@@ -1031,36 +1031,35 @@ void PGOUseFunc::insertLinearFuncCount(
     // TODO: Improve for it to not be quadratic.
     for (unsigned i = MinEdgeIndex; i < MaxEdgeIndex; i++)
       for (unsigned s = 0; s < Size; s++) {
-        const PGOUseEdge *E = BBCountInfo.OutEdges[s];
-        // FIXME AL FIX
-//        const BasicBlock *SrcBB = E->SrcBB;
+        PGOUseEdge *E = BBCountInfo.OutEdges[s];
+        const BasicBlock *SrcBB = E->SrcBB;
         const BasicBlock *DestBB = E->DestBB;
         if (DestBB == nullptr)
           continue;
-//        unsigned SuccNum = GetSuccessorNumber(SrcBB, DestBB);
-//        if (i == SuccNum)
-//          E->CountValue = PredictedCounts[i];
+        unsigned SuccNum = GetSuccessorNumber(SrcBB, DestBB);
+        if (i == SuccNum)
+          E->CountValue = PredictedCounts[i];
       }
   }
 }
 
 // Use prediction model to calculate supposed future profiling data
 // (specifically, edge counts).
-static PGOUseFunc computePredictedProfiles(
-    const std::vector<PGOUseFunc> &Funcs) {
+static std::shared_ptr<PGOUseFunc> computePredictedProfiles(
+    const std::vector<std::shared_ptr<PGOUseFunc>> &Funcs) {
   std::vector<std::vector<uint64_t>> LinearFuncCounts;
   for (unsigned i = 0; i < Funcs.size(); i++) {
-    LinearFuncCounts[i] = Funcs[i].linearizeProfileCounts();
+    LinearFuncCounts[i] = Funcs[i]->linearizeProfileCounts();
   }
 
   // FIXME AL Run the model, get final count with the same linearization
   // heuristic. Stub for now.
-  std::vector<uint64_t> PredictedLinearCounts = LinearFuncCounts[0];
+  auto PredictedLinearCounts = LinearFuncCounts[0];
 
   // From now on just use the copy of the first PGOUseFunc provided
   // as a blueprint.
-  PGOUseFunc ResultingFunc = Funcs[0];
-  ResultingFunc.insertLinearFuncCount(PredictedLinearCounts);
+  auto ResultingFunc = Funcs[0];
+  ResultingFunc->insertLinearFuncCount(PredictedLinearCounts);
   return ResultingFunc;
 }
 
@@ -1382,21 +1381,26 @@ static bool annotateAllFunctions(
     auto *BPI = LookupBPI(F);
     auto *BFI = LookupBFI(F);
 
-    std::vector<PGOUseFunc> Funcs(
-      Readers.size(), PGOUseFunc(F, &M, ComdatMembers, BPI, BFI));
+    std::vector<std::shared_ptr<PGOUseFunc>> Funcs;
+    for (unsigned i = 0; i < Readers.size(); i++) {
+      std::shared_ptr<PGOUseFunc> FuncPtr(
+            new PGOUseFunc(F, &M, ComdatMembers, BPI, BFI));
+      Funcs.push_back(std::move(FuncPtr));
+    }
+
     for (unsigned i = 0; i < Funcs.size(); i++) {
-      if (!Funcs[i].readCounters(Readers[i].get()))
+      if (!Funcs[i]->readCounters(Readers[i].get()))
         continue;
 
-      Funcs[i].populateCounters();
+      Funcs[i]->populateCounters();
     }
 
     // FIXME AL Check option for profile prediction.
-    PGOUseFunc Func = computePredictedProfiles(Funcs);
+    std::shared_ptr<PGOUseFunc> Func = computePredictedProfiles(Funcs);
 
-    Func.setBranchWeights();
-    Func.annotateIndirectCallSites();
-    PGOUseFunc::FuncFreqAttr FreqAttr = Func.getFuncFreqAttr();
+    Func->setBranchWeights();
+    Func->annotateIndirectCallSites();
+    PGOUseFunc::FuncFreqAttr FreqAttr = Func->getFuncFreqAttr();
     if (FreqAttr == PGOUseFunc::FFA_Cold)
       ColdFunctions.push_back(&F);
     else if (FreqAttr == PGOUseFunc::FFA_Hot)
