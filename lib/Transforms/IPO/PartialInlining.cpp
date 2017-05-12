@@ -119,7 +119,6 @@ bool PartialInlinerImpl::checkSuccessorBranchesIndependence(
                                            CurBBOccurences);
   }
 
-  // FIXME AL Needed?
   int AllSuccessorsPresentBBCount = 0;
   for (auto &Pair : BBOccurenceCounts) {
     if (Pair.second == 1)
@@ -259,9 +258,8 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionMerge(
 std::vector<Function *> PartialInlinerImpl::unswitchFunctionSeparate(
     Function *F,
     BasicBlock *EntryBlock, const std::vector<BasicBlock *> &ReturnBlocks) {
-
-  // FIXME AL Is entry block needed?
-  // FIXME AL Fix copying
+  // FIXME AL Is entry block parameter needed?
+  // FIXME AL Fix copying FIXME AL Which copying :(
   // Clone the function, so that we can hack away on it.
   ValueToValueMapTy VMap;
   Function *DuplicateFunction = CloneFunction(F, VMap);
@@ -296,7 +294,6 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionSeparate(
             .extractCodeRegion());
   }
 
-
   // Inline the top-level if test into all callers.
   std::vector<User *> Users(DuplicateFunction->user_begin(),
                             DuplicateFunction->user_end());
@@ -321,19 +318,19 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunction(Function *F) {
   BranchInst *BR = dyn_cast<BranchInst>(Term);
   SwitchInst *SW = dyn_cast<SwitchInst>(Term);
   if ((!BR || BR->isUnconditional()) && !SW)
-    std::vector<Function *>(); // FIXME AL Refactor.
+    return std::vector<Function *>(); // FIXME AL Refactor.
 
   if (!checkSuccessorBranchesIndependence(successors(EntryBlock)))
-    std::vector<Function *>();
+    return std::vector<Function *>();
 
   std::vector<BasicBlock *> ReturnBlocks;
   std::vector<BasicBlock *> NonReturnBlocks;
   succ_range &&succs = successors(EntryBlock);
   for (BasicBlock *BB : succs) {
     if (searchForReachableBB(BB, EntryBlock)) {
-      std::vector<Function *>();
+      return std::vector<Function *>();
     }
-    // Check for independency for a branch / select case.
+    // Check for independency for a branch / switch case.
     if (isa<ReturnInst>(BB->getTerminator())) {
       ReturnBlocks.push_back(BB);
     } else {
@@ -342,17 +339,17 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunction(Function *F) {
   }
 
   if (ReturnBlocks.size() != 1 &&
-      ReturnBlocks.size() != (size_t)std::distance(succs.begin(), succs.end()) &&
-      ReturnBlocks.size() != 0)
-    std::vector<Function *>();
+      ReturnBlocks.size() != (size_t)std::distance(succs.begin(), succs.end()))
+    return std::vector<Function *>();
+
+  // By the time we get here we're sure it's an unswitching candidate.
 
   ++NumPartialInlined;
   if (ReturnBlocks.size() == 1) {
     return unswitchFunctionMerge(F, EntryBlock,
                                  ReturnBlocks[0], NonReturnBlocks);
   } else if (ReturnBlocks.size() ==
-             (size_t)std::distance(succs.begin(), succs.end()) ||
-             ReturnBlocks.size() == 0) {
+             (size_t)std::distance(succs.begin(), succs.end())) {
     return unswitchFunctionSeparate(F, EntryBlock, ReturnBlocks);
   } else {
     return std::vector<Function *>();

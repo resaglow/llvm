@@ -268,6 +268,7 @@ void initializePGOInstrumentationUseLegacyPassPass(PassRegistry&);
 void initializePHIEliminationPass(PassRegistry&);
 void initializePhysicalRegisterUsageInfoPass(PassRegistry &);
 void initializePartialInlinerLegacyPassPass(PassRegistry &);
+void initializePartialInliningCostModelPassPass(PassRegistry &);
 void initializePartiallyInlineLibCallsLegacyPassPass(PassRegistry &);
 void initializePatchableFunctionPass(PassRegistry &);
 void initializePeepholeOptimizerPass(PassRegistry&);
