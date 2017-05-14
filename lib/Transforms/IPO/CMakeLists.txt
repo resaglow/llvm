@@ -23,6 +23,7 @@ add_llvm_library(LLVMipo
   LowerTypeTests.cpp
   MergeFunctions.cpp
   PartialInlining.cpp
+  PartialInliningCostModel.cpp
   PassManagerBuilder.cpp
   PruneEH.cpp
   SampleProfile.cpp
