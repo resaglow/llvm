@@ -87,8 +87,18 @@ static const int FuncDepthThreshold = 5; // FIXME AL Parameter?
 // Frequency of every function that can potentially be inlined.
 static std::map<std::string, uint64_t> FuncFreqMap;
 
+std::map<std::string, uint64_t>
+PartialInliningCostModelPass::getFuncFreqMap() {
+  return FuncFreqMap;
+}
+
 // Probabilities of every relevant inner branch in a function.
 static std::map<std::string, std::vector<uint64_t>> FuncCondProbMap;
+
+std::map<std::string, std::vector<uint64_t>>
+PartialInliningCostModelPass::getFuncCondProbMap() {
+  return FuncCondProbMap;
+}
 
 // Instruction count of all the instruction that can be possibly partially
 // inlined.
@@ -108,8 +118,9 @@ static std::map<std::string, std::pair<int, int>> FuncTotalDepthMap;
 static std::map<std::string, int> FuncAvgDepthMap;
 
 PartialInliningCostModelPassImpl::PartialInliningCostModelPassImpl(
-  BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI)
-  : BFI(BFI), BPI(BPI)
+  function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
+  function_ref<BranchProbabilityInfo *(Function &)> LookupBPI)
+  : LookupBFI(LookupBFI), LookupBPI(LookupBPI)
 {}
 
 bool PartialInliningCostModelPassImpl
@@ -194,7 +205,7 @@ bool PartialInliningCostModelPassImpl::collectModuleProfileHeuristics(
 }
 
 void PartialInliningCostModelPassImpl::extractBlockBreq(Function *F) {
-  auto FuncEntryProfCount = BFI->getEntryFreq();
+  auto FuncEntryProfCount = LookupBFI(*F)->getEntryFreq();
   if (!FuncEntryProfCount)
     return;
 
@@ -211,9 +222,10 @@ void PartialInliningCostModelPassImpl::extractBranchProb(
        SI != SE;
        ++SI) {
     if (SI.getSuccessorIndex() != SingleReturnBlockIdx)
-      AvgSuccessorProb += BPI->getEdgeProbability(EntryBlock, *SI);
+      AvgSuccessorProb += LookupBPI(*F)->getEdgeProbability(EntryBlock, *SI);
   }
-  AvgSuccessorProb /= std::distance(succ_begin(EntryBlock), succ_end(EntryBlock)) - 1;
+  AvgSuccessorProb /= std::distance(succ_begin(EntryBlock),
+                                    succ_end(EntryBlock)) - 1;
 }
 
 void PartialInliningCostModelPassImpl::
@@ -269,7 +281,7 @@ collectFunctionProfileHeuristics(FuncInfo *Info) {
 void PartialInliningCostModelPass::
 getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<BlockFrequencyInfoWrapperPass>();
-  AU.addRequired<BranchProbabilityInfoWrapperPass>();
+  AU.setPreservesAll();
 }
 
 char PartialInliningCostModelPass::ID = 0;
@@ -280,32 +292,44 @@ INITIALIZE_PASS_DEPENDENCY(BlockFrequencyInfoWrapperPass)
 INITIALIZE_PASS_END(PartialInliningCostModelPass, "partial-inliner-cost-model",
                     "Partial Inliner", false, false)
 
-// Automatically enable the pass.
-static void registerPartialInliningCostModelPass(
-  const PassManagerBuilder &, legacy::PassManagerBase &PM) {
-  PM.add(new PartialInliningCostModelPass());
-}
-static RegisterStandardPasses
-  RegisterMyPass(PassManagerBuilder::EP_EarlyAsPossible,
-                 registerPartialInliningCostModelPass);
+//static void registerPartialInliningCostModelPass(
+//  const PassManagerBuilder &, legacy::PassManagerBase &PM) {
+//  PM.add(new PartialInliningCostModelPass());
+//}
+//static RegisterStandardPasses
+//  RegisterMyPass(PassManagerBuilder::EP_ModuleOptimizerEarly,
+//                 registerPartialInliningCostModelPass);
 
 bool PartialInliningCostModelPass::runOnModule(Module &M) {
   if (skipModule(M))
     return false;
 
-  BFI = &getAnalysis<BlockFrequencyInfoWrapperPass>().getBFI();
-  BPI = &getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
+  return false;
 
-  return PartialInliningCostModelPassImpl(BFI, BPI).collectModuleProfileHeuristics(M);
+  auto LookupBFI = [this](Function &F) {
+    return &this->getAnalysis<BlockFrequencyInfoWrapperPass>(F).getBFI();
+  };
+
+  auto LookupBPI = [this](Function &F) {
+    return &this->getAnalysis<BranchProbabilityInfoWrapperPass>(F).getBPI();
+  };
+
+  return PartialInliningCostModelPassImpl(LookupBFI, LookupBPI)
+      .collectModuleProfileHeuristics(M);
 }
 
 PreservedAnalyses PartialInliningCostModelPass::
 run(Module &M, ModuleAnalysisManager &AM) {
-  BlockFrequencyInfo *BFI;
-  BranchProbabilityInfo *BPI;
-  // FIXME AL Retrieve BFI/BPI this way (using the new PM) as well.
-  auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
-  if (PartialInliningCostModelPassImpl(BFI, BPI).collectModuleProfileHeuristics(M))
+  auto LookupBFI = [this](Function &F) {
+    return &this->getAnalysis<BlockFrequencyInfoWrapperPass>(F).getBFI();
+  };
+
+  auto LookupBPI = [this](Function &F) {
+    return &this->getAnalysis<BranchProbabilityInfoWrapperPass>(F).getBPI();
+  };
+
+  if (PartialInliningCostModelPassImpl(LookupBFI, LookupBPI)
+      .collectModuleProfileHeuristics(M))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
 }

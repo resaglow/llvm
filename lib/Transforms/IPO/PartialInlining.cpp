@@ -23,6 +23,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/PartialInliningCostModel.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 using namespace llvm;
@@ -31,14 +32,21 @@ using namespace llvm;
 
 STATISTIC(NumPartialInlined, "Number of functions partially inlined");
 
+static cl::opt<unsigned> PartInlineOptForSize(
+    "part-inliner-opt-for-size", cl::init(0), cl::Hidden,
+    cl::desc("Set the degree to which patial inliner should optimize for "
+             "code size"));
+
 namespace {
 struct PartialInlinerImpl {
-  PartialInlinerImpl(InlineFunctionInfo IFI) : IFI(IFI) {}
+  PartialInlinerImpl(InlineFunctionInfo IFI,
+                     PartialInliningCostModelPass *PICM) : IFI(IFI), PICM(PICM) {}
   bool run(Module &M);
   std::vector<Function *> unswitchFunction(Function *F);
 
 private:
   InlineFunctionInfo IFI;
+  PartialInliningCostModelPass *PICM;
 
   // Check if a given given target basic block is reachable from
   // a given source basic block.
@@ -81,7 +89,10 @@ struct PartialInlinerLegacyPass : public ModulePass {
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<AssumptionCacheTracker>();
+    AU.addRequired<PartialInliningCostModelPass>();
+    AU.addPreserved<PartialInliningCostModelPass>();
   }
+
   bool runOnModule(Module &M) override {
     if (skipModule(M))
       return false;
@@ -91,8 +102,11 @@ struct PartialInlinerLegacyPass : public ModulePass {
         [&ACT](Function &F) -> AssumptionCache & {
       return ACT->getAssumptionCache(F);
     };
+    PartialInliningCostModelPass *PICM =
+        &getAnalysis<PartialInliningCostModelPass>();
+
     InlineFunctionInfo IFI(nullptr, &GetAssumptionCache);
-    return PartialInlinerImpl(IFI).run(M);
+    return PartialInlinerImpl(IFI, PICM).run(M);
   }
 };
 }
@@ -156,11 +170,11 @@ void PartialInlinerImpl::collectReachableBlocks(
     BasicBlock *StartingBB,
     std::vector<BasicBlock *> &ReachableBlocks,
     std::set<BasicBlock *> &ReachableBlocksSet) {
+  if (ReachableBlocksSet.find(StartingBB) == ReachableBlocksSet.end()) {
+    ReachableBlocks.push_back(StartingBB);
+  }
+  ReachableBlocksSet.insert(StartingBB);
   for (const auto &BB : successors(StartingBB)) {
-    if (ReachableBlocksSet.find(BB) == ReachableBlocksSet.end()) {
-      ReachableBlocks.push_back(BB);
-    }
-    ReachableBlocksSet.insert(BB);
     collectReachableBlocks(BB, ReachableBlocks, ReachableBlocksSet);
   }
 }
@@ -222,6 +236,12 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionMerge(
     std::set<BasicBlock *> ExtractedBlockSet;
     // Collect all blocks reachable from the current non returning successor.
     collectReachableBlocks(BB, ToExtract, ExtractedBlockSet);
+    // Except the final return block.
+    ToExtract.erase(std::remove_if(ToExtract.begin(), ToExtract.end(),
+                                   [&](BasicBlock *X) {
+                      return X == NewReturnBlock || X == PreReturn;
+                    }),
+                    ToExtract.end());
 
     // The CodeExtractor needs a dominator tree.
     DominatorTree DT;
@@ -311,6 +331,7 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionSeparate(
   return ExtractedFunctions;
 }
 
+// FIXME AL Integrate optionals
 std::vector<Function *> PartialInlinerImpl::unswitchFunction(Function *F) {
   // First, verify that this function is an unswitching candidate...
   BasicBlock *EntryBlock = &F->front();
@@ -405,13 +426,15 @@ ModulePass *llvm::createPartialInliningPass() {
 
 PreservedAnalyses PartialInlinerPass::run(Module &M,
                                           ModuleAnalysisManager &AM) {
+  // FIXME AL Add cost model dependecy
   auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   std::function<AssumptionCache &(Function &)> GetAssumptionCache =
       [&FAM](Function &F) -> AssumptionCache & {
     return FAM.getResult<AssumptionAnalysis>(F);
   };
   InlineFunctionInfo IFI(nullptr, &GetAssumptionCache);
-  if (PartialInlinerImpl(IFI).run(M))
+  PartialInliningCostModelPass *PICM = nullptr; // FIXME AL FIX
+  if (PartialInlinerImpl(IFI, PICM).run(M))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
 }

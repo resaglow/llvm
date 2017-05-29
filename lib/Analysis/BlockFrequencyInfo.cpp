@@ -269,3 +269,5 @@ BlockFrequencyPrinterPass::run(Function &F, FunctionAnalysisManager &AM) {
   AM.getResult<BlockFrequencyAnalysis>(F).print(OS);
   return PreservedAnalyses::all();
 }
+
+

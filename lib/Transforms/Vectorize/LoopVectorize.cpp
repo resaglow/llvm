@@ -89,6 +89,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/IPO/PartialInliningCostModel.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -108,13 +109,18 @@ using namespace llvm::PatternMatch;
 STATISTIC(LoopsVectorized, "Number of loops vectorized");
 STATISTIC(LoopsAnalyzed, "Number of loops analyzed for vectorization");
 
+static cl::opt<unsigned> LoopVectorizeOptForSize(
+    "loop-vec-opt-for-size", cl::init(0), cl::Hidden,
+    cl::desc("Set the degree to which loop vectorize should optimize for "
+             "code size"));
+
 static cl::opt<bool>
     EnableIfConversion("enable-if-conversion", cl::init(true), cl::Hidden,
                        cl::desc("Enable if-conversion during vectorization."));
 
 /// We don't vectorize loops with a known constant trip count below this number.
 static cl::opt<unsigned> TinyTripCountVectorThreshold(
-    "vectorizer-min-trip-count", cl::init(16), cl::Hidden,
+    "vectorizer-min-trip-count", cl::init(2), cl::Hidden,
     cl::desc("Don't vectorize loops with a constant "
              "trip count that is smaller than this "
              "value."));
@@ -1857,9 +1863,10 @@ public:
                              const TargetLibraryInfo *TLI, DemandedBits *DB,
                              AssumptionCache *AC,
                              OptimizationRemarkEmitter *ORE, const Function *F,
-                             const LoopVectorizeHints *Hints)
+                             const LoopVectorizeHints *Hints,
+                             BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI)
       : TheLoop(L), PSE(PSE), LI(LI), Legal(Legal), TTI(TTI), TLI(TLI), DB(DB),
-        AC(AC), ORE(ORE), TheFunction(F), Hints(Hints) {}
+        AC(AC), ORE(ORE), TheFunction(F), Hints(Hints), BFI(BFI), BPI(BPI) {}
 
   /// Information about vectorization costs
   struct VectorizationFactor {
@@ -2017,6 +2024,11 @@ public:
   SmallPtrSet<const Value *, 16> ValuesToIgnore;
   /// Values to ignore in the cost model when VF > 1.
   SmallPtrSet<const Value *, 16> VecValuesToIgnore;
+
+  /// Block frequency information.
+  BlockFrequencyInfo *BFI;
+  /// Branch probability information.
+  BranchProbabilityInfo *BPI;
 };
 
 /// \brief This holds vectorization requirements that must be verified late in
@@ -2124,6 +2136,9 @@ struct LoopVectorize : public FunctionPass {
     auto *LAA = &getAnalysis<LoopAccessLegacyAnalysis>();
     auto *DB = &getAnalysis<DemandedBitsWrapperPass>().getDemandedBits();
     auto *ORE = &getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
+    // FIXME AL Is this needed?
+//    auto *PIFFM =
+//        &getAnalysis<PartialInliningCostModelPass>().getFuncFreqMap();
 
     std::function<const LoopAccessInfo &(Loop &)> GetLAA =
         [&](Loop &L) -> const LoopAccessInfo & { return LAA->getInfo(&L); };
@@ -2145,6 +2160,7 @@ struct LoopVectorize : public FunctionPass {
     AU.addRequired<LoopAccessLegacyAnalysis>();
     AU.addRequired<DemandedBitsWrapperPass>();
     AU.addRequired<OptimizationRemarkEmitterWrapperPass>();
+    AU.addRequired<PartialInliningCostModelPass>();
     AU.addPreserved<LoopInfoWrapperPass>();
     AU.addPreserved<DominatorTreeWrapperPass>();
     AU.addPreserved<BasicAAWrapperPass>();
@@ -6158,16 +6174,19 @@ LoopVectorizationCostModel::selectVectorizationFactor(bool OptForSize) {
     }
   }
 
+  // TODO AL What if the trip count is small but still bigger
+  // than 32 that is presumably stated here.
+  unsigned TC = PSE.getSE()->getSmallConstantTripCount(TheLoop);
+  DEBUG(dbgs() << "LV: Found trip count: " << TC << '\n');
+
   // If we optimize the program for size, avoid creating the tail loop.
   if (OptForSize) {
-    unsigned TC = PSE.getSE()->getSmallConstantTripCount(TheLoop);
-    DEBUG(dbgs() << "LV: Found trip count: " << TC << '\n');
-
-    // If we don't know the precise trip count, don't try to vectorize.
+    // IF we don't know precise trip count in case of optimizing for size,
+    // don't try to vectorize to avoid storing scalar version.
     if (TC < 2) {
       ORE->emit(
           createMissedAnalysis("UnknownLoopCountComplexCFG")
-          << "unable to calculate the loop count due to complex control flow");
+          << "unable to calculate the loop coupnt due to complex control flow");
       DEBUG(dbgs() << "LV: Aborting. A tail loop is required with -Os/-Oz.\n");
       return Factor;
     }
@@ -6214,23 +6233,59 @@ LoopVectorizationCostModel::selectVectorizationFactor(bool OptForSize) {
     Cost = expectedCost(Width).first / (float)Width;
   }
 
-  for (unsigned i = 2; i <= VF; i *= 2) {
-    // Notice that the vector loop needs to be executed less times, so
-    // we need to divide the cost of the vector loops by the width of
-    // the vector elements.
-    VectorizationCostTy C = expectedCost(i);
-    float VectorCost = C.first / (float)i;
-    DEBUG(dbgs() << "LV: Vector loop of width " << i
-                 << " costs: " << (int)VectorCost << ".\n");
-    if (!C.second && !ForceVectorization) {
-      DEBUG(
-          dbgs() << "LV: Not considering vector loop of width " << i
-                 << " because it will not generate any vector instructions.\n");
-      continue;
+  // FIXME AL
+  auto LoopProfCountOpt = BFI->getBlockProfileCount(TheLoop->getLoopPreheader());
+  // TODO LA Add condition not to check this if the loop trip count is
+  // constant.
+  if (LoopProfCountOpt) {
+    auto LoopProfCount = TC; // LoopProfCountOpt.getValue();
+    float TotalCost = Cost * LoopProfCount;
+    for (unsigned i = 2; i <= VF; i *= 2) {
+      // Number of fully scalar iterations of the loop.
+      unsigned ScalarVersionTC = LoopProfCount % i;
+
+      // Notice that the vector loop needs to be executed less times, so
+      // we need to divide the cost of the vector loops by the width of
+      // the vector elements.
+      VectorizationCostTy C = expectedCost(i);
+      float VectorCost = C.first / (float)i;
+      float TotalVectorCost = VectorCost * (LoopProfCount - ScalarVersionTC);
+
+      TotalVectorCost += expectedCost(1).first * ScalarVersionTC;
+
+      DEBUG(dbgs() << "LV BFI: Vector loop of width " << i
+                   << " costs (totally): " << (int)TotalVectorCost << ".\n");
+      if (!C.second && !ForceVectorization) {
+        DEBUG(
+            dbgs() << "LV BFI: Not considering vector loop of width " << i
+                   << " because it will not generate any vector instructions.\n");
+        continue;
+      }
+      if (TotalVectorCost < TotalCost) {
+        Cost = VectorCost; // FIXME AL Should be leave it as is?
+        TotalCost = TotalVectorCost;
+        Width = i;
+      }
     }
-    if (VectorCost < Cost) {
-      Cost = VectorCost;
-      Width = i;
+  } else {
+    for (unsigned i = 2; i <= VF; i *= 2) {
+      // Notice that the vector loop needs to be executed less times, so
+      // we need to divide the cost of the vector loops by the width of
+      // the vector elements.
+      VectorizationCostTy C = expectedCost(i);
+      float VectorCost = C.first / (float)i;
+      DEBUG(dbgs() << "LV: Vector loop of width " << i
+                   << " costs: " << (int)VectorCost << ".\n");
+      if (!C.second && !ForceVectorization) {
+        DEBUG(
+            dbgs() << "LV: Not considering vector loop of width " << i
+                   << " because it will not generate any vector instructions.\n");
+        continue;
+      }
+      if (VectorCost < Cost) {
+        Cost = VectorCost;
+        Width = i;
+      }
     }
   }
 
@@ -7163,6 +7218,7 @@ unsigned LoopVectorizationCostModel::getInstructionCost(Instruction *I,
 
 char LoopVectorize::ID = 0;
 static const char lv_name[] = "Loop Vectorization";
+// FIXME AL Is PartialInlining pass dependency necessary?
 INITIALIZE_PASS_BEGIN(LoopVectorize, LV_NAME, lv_name, false, false)
 INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(BasicAAWrapperPass)
@@ -7178,6 +7234,7 @@ INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
 INITIALIZE_PASS_DEPENDENCY(LoopAccessLegacyAnalysis)
 INITIALIZE_PASS_DEPENDENCY(DemandedBitsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(OptimizationRemarkEmitterWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(PartialInliningCostModelPass)
 INITIALIZE_PASS_END(LoopVectorize, LV_NAME, lv_name, false, false)
 
 namespace llvm {
@@ -7416,7 +7473,8 @@ bool LoopVectorizePass::processLoop(Loop *L) {
 
   // Use the cost model.
   LoopVectorizationCostModel CM(L, PSE, LI, &LVL, *TTI, TLI, DB, AC, ORE, F,
-                                &Hints);
+                                &Hints, BFI, nullptr);
+  // FIXME AL Where the heck is BPI???
   CM.collectValuesToIgnore();
 
   // Check the function attributes to find out if this function should be
@@ -7641,7 +7699,7 @@ bool LoopVectorizePass::runImpl(
 
 }
 
-
+// FIXME AL Add presevred pass to this (new manager-based) entry point.
 PreservedAnalyses LoopVectorizePass::run(Function &F,
                                          FunctionAnalysisManager &AM) {
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);

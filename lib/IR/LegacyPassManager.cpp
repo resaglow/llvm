@@ -596,7 +596,6 @@ AnalysisUsage *PMTopLevelManager::findAnalysisUsage(Pass *P) {
 /// P are run before P is run. Update analysis info maintained by
 /// the manager. Remove dead passes. This is a recursive function.
 void PMTopLevelManager::schedulePass(Pass *P) {
-
   // TODO : Allocate function manager for this pass, other wise required set
   // may be inserted into previous function manager
 

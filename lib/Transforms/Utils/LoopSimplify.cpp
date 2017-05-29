@@ -65,6 +65,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/IPO/PartialInliningCostModel.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
@@ -781,6 +782,7 @@ namespace {
       AU.addPreservedID(LCSSAID);
       AU.addPreserved<DependenceAnalysisWrapperPass>();
       AU.addPreservedID(BreakCriticalEdgesID);  // No critical edges added.
+      AU.addPreserved<PartialInliningCostModelPass>();
     }
 
     /// verifyAnalysis() - Verify LoopSimplifyForm's guarantees.

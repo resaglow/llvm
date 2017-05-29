@@ -45,6 +45,7 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
+#include "llvm/Transforms/IPO/PartialInliningCostModel.h"
 using namespace llvm;
 
 #define DEBUG_TYPE "lcssa"
@@ -362,6 +363,8 @@ struct LCSSAWrapperPass : public FunctionPass {
     // This is needed to perform LCSSA verification inside LPPassManager
     AU.addRequired<LCSSAVerificationPass>();
     AU.addPreserved<LCSSAVerificationPass>();
+
+    AU.addPreserved<PartialInliningCostModelPass>();
   }
 };
 }

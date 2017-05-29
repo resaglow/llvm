@@ -1,3 +1,6 @@
+#ifndef LLVM_TRANSFORMS_IPO_PARTIALINLINING_CM_H
+#define LLVM_TRANSFORMS_IPO_PARTIALINLINING_CM_H
+
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Pass.h"
@@ -25,34 +28,43 @@ struct PartInlineFuncProfCounts {
   std::vector<uint64_t> ConditionBlockCounts; 
 };
 
-class PartialInliningCostModelPass : public ModulePass {
-public:
+static const std::string ThisPassName = "PartInlineCM"; // FIXME AL
+
+struct PartialInliningCostModelPass : public ModulePass {
   static char ID;
 
-  PartialInliningCostModelPass() : ModulePass(ID) {}
+  PartialInliningCostModelPass() : ModulePass(ID) {
+    initializePartialInliningCostModelPassPass(
+        *PassRegistry::getPassRegistry());
+  }
 
-  virtual bool runOnModule(Module &F);
+  virtual bool runOnModule(Module &M);
 
-  PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 
-private:
-  BlockFrequencyInfo *BFI;
-  BranchProbabilityInfo *BPI;
+  virtual StringRef getPassName() const override {
+    return StringRef(ThisPassName);
+  }
 
-  void getAnalysisUsage(AnalysisUsage &AU) const override;
+//  PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
+
+  std::map<std::string, uint64_t> getFuncFreqMap();
+
+  std::map<std::string, std::vector<uint64_t>> getFuncCondProbMap();
+
+  virtual void getAnalysisUsage(AnalysisUsage &AU) const override;
 };
 
-class PartialInliningCostModelPassImpl {
-public:
+struct PartialInliningCostModelPassImpl {
   PartialInliningCostModelPassImpl(
-    BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI);
+    function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
+    function_ref<BranchProbabilityInfo *(Function &)> LookupBPI);
 
   // FIXME Pointers vs. refs
   bool collectModuleProfileHeuristics(Module &M);
 
-private:
-  BlockFrequencyInfo *BFI;
-  BranchProbabilityInfo *BPI;
+  function_ref<BlockFrequencyInfo *(Function &)> LookupBFI;
+  function_ref<BranchProbabilityInfo *(Function &)> LookupBPI;
 
   // Calculate block frequencies of funcs that are relevant to partially inline
   // and depths of such functions in a call stack.
@@ -80,3 +92,6 @@ private:
 };
 
 } // llvm
+
+
+#endif
