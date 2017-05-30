@@ -42,6 +42,11 @@ using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll"
 
+static cl::opt<unsigned> UnrollOptForSize(
+    "loop-unroll-opt-for-size", cl::init(0), cl::Hidden,
+    cl::desc("Set the degree to which loop unroll should optimize for "
+             "code size"));
+
 static cl::opt<unsigned>
     UnrollThreshold("unroll-threshold", cl::Hidden,
                     cl::desc("The baseline cost threshold for loop unrolling"));

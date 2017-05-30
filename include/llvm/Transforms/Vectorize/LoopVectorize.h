@@ -97,7 +97,7 @@ struct LoopVectorizePass : public PassInfoMixin<LoopVectorizePass> {
                BlockFrequencyInfo &BFI_, TargetLibraryInfo *TLI_,
                DemandedBits &DB_, AliasAnalysis &AA_, AssumptionCache &AC_,
                std::function<const LoopAccessInfo &(Loop &)> &GetLAA_,
-               OptimizationRemarkEmitter &ORE);
+               OptimizationRemarkEmitter &ORE_);
 
   bool processLoop(Loop *L);
 };

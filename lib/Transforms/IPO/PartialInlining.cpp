@@ -17,13 +17,13 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/PartialInliningCostModel.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Transforms/IPO.h"
-#include "llvm/Transforms/IPO/PartialInliningCostModel.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 using namespace llvm;
@@ -97,16 +97,16 @@ struct PartialInlinerLegacyPass : public ModulePass {
     if (skipModule(M))
       return false;
 
-    AssumptionCacheTracker *ACT = &getAnalysis<AssumptionCacheTracker>();
-    std::function<AssumptionCache &(Function &)> GetAssumptionCache =
-        [&ACT](Function &F) -> AssumptionCache & {
-      return ACT->getAssumptionCache(F);
-    };
-    PartialInliningCostModelPass *PICM =
-        &getAnalysis<PartialInliningCostModelPass>();
+   AssumptionCacheTracker *ACT = &getAnalysis<AssumptionCacheTracker>();
+   std::function<AssumptionCache &(Function &)> GetAssumptionCache =
+       [&ACT](Function &F) -> AssumptionCache & {
+     return ACT->getAssumptionCache(F);
+   };
+   PartialInliningCostModelPass *PICM =
+       &getAnalysis<PartialInliningCostModelPass>();
 
-    InlineFunctionInfo IFI(nullptr, &GetAssumptionCache);
-    return PartialInlinerImpl(IFI, PICM).run(M);
+   InlineFunctionInfo IFI(nullptr, &GetAssumptionCache);
+   return PartialInlinerImpl(IFI, PICM).run(M);
   }
 };
 }
@@ -278,8 +278,6 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionMerge(
 std::vector<Function *> PartialInlinerImpl::unswitchFunctionSeparate(
     Function *F,
     BasicBlock *EntryBlock, const std::vector<BasicBlock *> &ReturnBlocks) {
-  // FIXME AL Is entry block parameter needed?
-  // FIXME AL Fix copying FIXME AL Which copying :(
   // Clone the function, so that we can hack away on it.
   ValueToValueMapTy VMap;
   Function *DuplicateFunction = CloneFunction(F, VMap);
@@ -289,7 +287,6 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionSeparate(
     NewReturnBlocks.push_back(cast<BasicBlock>(VMap[ReturnBlock]));
   }
 
-  // FIXME AL Comment + Remove CP.
   std::vector<Function *> ExtractedFunctions;
 
   // Extract all the relevant blocks of code under conditions.
@@ -426,14 +423,16 @@ ModulePass *llvm::createPartialInliningPass() {
 
 PreservedAnalyses PartialInlinerPass::run(Module &M,
                                           ModuleAnalysisManager &AM) {
-  // FIXME AL Add cost model dependecy
   auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   std::function<AssumptionCache &(Function &)> GetAssumptionCache =
       [&FAM](Function &F) -> AssumptionCache & {
     return FAM.getResult<AssumptionAnalysis>(F);
   };
   InlineFunctionInfo IFI(nullptr, &GetAssumptionCache);
-  PartialInliningCostModelPass *PICM = nullptr; // FIXME AL FIX
+
+  // FIXME AL Stub, get commented out thing to work.
+  PartialInliningCostModelPass *PICM = nullptr; // AM.getResult<PartialInliningCostModelPass>(M);
+
   if (PartialInlinerImpl(IFI, PICM).run(M))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();

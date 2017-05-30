@@ -62,6 +62,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/PartialInliningCostModel.h"
 #include "llvm/Analysis/ScalarEvolutionExpander.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -89,7 +90,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/IPO/PartialInliningCostModel.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -2136,9 +2136,15 @@ struct LoopVectorize : public FunctionPass {
     auto *LAA = &getAnalysis<LoopAccessLegacyAnalysis>();
     auto *DB = &getAnalysis<DemandedBitsWrapperPass>().getDemandedBits();
     auto *ORE = &getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
-    // FIXME AL Is this needed?
-//    auto *PIFFM =
-//        &getAnalysis<PartialInliningCostModelPass>().getFuncFreqMap();
+
+    auto PIFFM =
+        getAnalysis<PartialInliningCostModelPass>().getFuncFreqMap();
+    auto PIFCPM =
+        getAnalysis<PartialInliningCostModelPass>().getFuncCondProbMap();
+
+    // Only run on functions that were estimated by the cost model.
+    if (LoopVectorizeOptForSize && PIFFM.find(F.getName()) == PIFFM.end())
+      return false;
 
     std::function<const LoopAccessInfo &(Loop &)> GetLAA =
         [&](Loop &L) -> const LoopAccessInfo & { return LAA->getInfo(&L); };
@@ -5125,13 +5131,13 @@ bool LoopVectorizationLegality::canVectorize() {
   }
 
   // ScalarEvolution needs to be able to find the exit count.
-  const SCEV *ExitCount = PSE.getBackedgeTakenCount();
-  if (ExitCount == PSE.getSE()->getCouldNotCompute()) {
-    ORE->emit(createMissedAnalysis("CantComputeNumberOfIterations")
-              << "could not determine number of loop iterations");
-    DEBUG(dbgs() << "LV: SCEV could not compute the loop exit count.\n");
-    return false;
-  }
+//  const SCEV *ExitCount = PSE.getBackedgeTakenCount();
+//  if (ExitCount == PSE.getSE()->getCouldNotCompute()) {
+//    ORE->emit(createMissedAnalysis("CantComputeNumberOfIterations")
+//              << "could not determine number of loop iterations");
+//    DEBUG(dbgs() << "LV: SCEV could not compute the loop exit count.\n");
+//    return false;
+//  }
 
   // Check if we can vectorize the instructions and CFG in this loop.
   if (!canVectorizeInstrs()) {
@@ -6233,12 +6239,11 @@ LoopVectorizationCostModel::selectVectorizationFactor(bool OptForSize) {
     Cost = expectedCost(Width).first / (float)Width;
   }
 
-  // FIXME AL
-  auto LoopProfCountOpt = BFI->getBlockProfileCount(TheLoop->getLoopPreheader());
-  // TODO LA Add condition not to check this if the loop trip count is
-  // constant.
-  if (LoopProfCountOpt) {
-    auto LoopProfCount = TC; // LoopProfCountOpt.getValue();
+  // Get the profile-based info.
+  auto LoopProfCountOpt = BFI->getBlockProfileCount(TheLoop->getLoopLatch());
+  // We only use profile-guided method if the loop trip count is constant.
+  if (LoopProfCountOpt && TC == 0) {
+    auto LoopProfCount = LoopProfCountOpt.getValue();
     float TotalCost = Cost * LoopProfCount;
     for (unsigned i = 2; i <= VF; i *= 2) {
       // Number of fully scalar iterations of the loop.
@@ -6262,7 +6267,7 @@ LoopVectorizationCostModel::selectVectorizationFactor(bool OptForSize) {
         continue;
       }
       if (TotalVectorCost < TotalCost) {
-        Cost = VectorCost; // FIXME AL Should be leave it as is?
+        Cost = VectorCost;
         TotalCost = TotalVectorCost;
         Width = i;
       }
@@ -6411,6 +6416,10 @@ unsigned LoopVectorizationCostModel::selectInterleaveCount(bool OptForSize,
   if (EnableIndVarRegisterHeur)
     IC = PowerOf2Floor((TargetNumRegisters - R.LoopInvariantRegs - 1) /
                        std::max(1U, (R.MaxLocalUsers - 1)));
+
+  if (LoopVectorizeOptForSize) {
+    IC *= LoopVectorizeOptForSize / 100.0;
+  }
 
   // Clamp the interleave ranges to reasonable counts.
   unsigned MaxInterleaveCount = TTI.getMaxInterleaveFactor(VF);
@@ -7474,7 +7483,6 @@ bool LoopVectorizePass::processLoop(Loop *L) {
   // Use the cost model.
   LoopVectorizationCostModel CM(L, PSE, LI, &LVL, *TTI, TLI, DB, AC, ORE, F,
                                 &Hints, BFI, nullptr);
-  // FIXME AL Where the heck is BPI???
   CM.collectValuesToIgnore();
 
   // Check the function attributes to find out if this function should be

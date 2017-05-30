@@ -1010,7 +1010,6 @@ std::vector<uint64_t> PGOUseFunc::linearizeProfileCounts() const {
   return LinearCounts;
 }
 
-// FIXME AL Transform into a method.
 void PGOUseFunc::insertLinearFuncCount(
     const std::vector<uint64_t> &PredictedCounts) {
   // Fetch the copy of the current func so we could update profile count on it.
@@ -1049,103 +1048,102 @@ void PGOUseFunc::insertLinearFuncCount(
 
 // Work linearized profile counts through the prediction model and provide the
 // new (predicted) ones.
-static Optional<std::vector<uint64_t>> getPredictedLinearCounts(
-    std::vector<std::vector<uint64_t>> InitialCounts) {
-  // FIXME AL Fix cerrs / missing cases.
+// Due to C++/Python API we HAVE to use pointer return type. o_o.
+static void *getPredictedLinearCounts(
+    const std::vector<std::vector<uint64_t>> &InitialCounts,
+    std::vector<uint64_t> &FinalCounts) {
+  constexpr void *PredictionRC = NULL;
 
-  Optional<std::vector<uint64_t>> FinalCounts = None;
+  // FIXME AL Fix cerrs / missing cases.
 
   // Standard procedure to call Python funcs & translate results.
   const char ActualProgramName[] = "opt";
   wchar_t WideProgramName[sizeof(ActualProgramName)];
 
   mbstowcs(WideProgramName, ActualProgramName, sizeof(ActualProgramName));
-  Py_SetProgramName(programName);
+  Py_SetProgramName(WideProgramName);
   Py_Initialize();
   import_array();
 
   // Build the 2D array for interacting with Python.
   constexpr int DimsCount = 2;
-  npy_intp Dims[DimsCount] = {InitialCounts.size(), InitialCounts[0].size()};
-  long double (*cArr)[Dims[1]] = new long double[Dims[0]][Dims[1]];
-  if (!cArr) {
-    std::cerr << "Out of memory." << std::endl;
-    return FinalCounts;
-  }
+  npy_intp Dims[DimsCount] = {static_cast<npy_intp>(InitialCounts.size()),
+                              static_cast<npy_intp>(InitialCounts[0].size())};
+
+  int Dim1 = InitialCounts.size();
+  int Dim2 = InitialCounts[0].size();
+  long long *cArr = new long long[Dim1 * Dim2];
 
   // Have to copy elements manually, there's no 2D vector/array conversion.
-  for (unsigned i = 0; i < Dims[0]; i++) {
-    for (unsigned j = 0; j < Dims[1]; j++) {
-      cArr[i][j] = InitialCounts[i][j];
+  for (int i = 0; i < Dims[0]; i++) {
+    for (int j = 0; j < Dims[1]; j++) {
+      cArr[i * Dim1 + j] = InitialCounts[i][j];
     }
   }
 
   // Convert it to a NumPy array.
-  PyObject *pArray = PyArray_SimpleNewFromData(ND, dims, NPY_LONGDOUBLE,
+  PyObject *pArray = PyArray_SimpleNewFromData(DimsCount, Dims, NPY_LONGDOUBLE,
                                                reinterpret_cast<void *>(cArr));
   if (!pArray) {
-    return FinalCounts;
+    return PredictionRC;
   }
   PyArrayObject *npArr = reinterpret_cast<PyArrayObject *>(pArray);
 
-  std::string LSTMPath = "/home/resaglow/Dev/llvm-global/predict-lstm/cpp-python";
-  std::cout << LSTMPath << std::endl;
-  PyObject* SysPath = PySys_GetObject((char *)"path");
+  // FIXME AL Get rid of global path
+  std::string LSTMPath = "/home/resaglow/Dev/llvm-global/llvm-git/utils/predict-lstm/lstm";
+  PyObject* SysPath = PySys_GetObject(const_cast<char *>("path"));
   PyObject* PyLSTMPath = PyUnicode_FromString(LSTMPath.c_str());
   PyList_Append(SysPath, PyLSTMPath);
   Py_DECREF(PyLSTMPath);
 
-  // import mymodule.array_tutorial
-  const char *moduleName = "mymodule";
+  // import lstm.predict_counts
+  const char *moduleName = "lstm";
   PyObject *pName = PyUnicode_FromString(moduleName);
   if (!pName) {
-    return FinalCounts;
+    return PredictionRC;
   }
   PyObject *pModule = PyImport_Import(pName);
   Py_DECREF(pName);
   if (!pModule) {
-    return FinalCounts;
+    return PredictionRC;
   }
 
-  const char *func_name = "array_tutorial";
+  const char *func_name = "predict_counts";
   PyObject *pFunc = PyObject_GetAttrString(pModule, func_name);
   if (!pFunc) {
-    return FinalCounts;
+    return PredictionRC;
   }
   if (!PyCallable_Check(pFunc)) {
-    std::cerr << moduleName << "." << func_name
-              << " is not callable." << std::endl;
-    return FinalCounts;
+    DEBUG(dbgs() << moduleName << "." << func_name
+                 << " is not callable.\n");
+    return PredictionRC;
   }
 
   PyObject *pArgs = PyTuple_New(1);
   PyTuple_SetItem(pArgs, 0, reinterpret_cast<PyObject*>(npArr));
 
-  // np_ret = mymodule.array_tutorial(np_arg)
+  // np_ret = lstm.predict_counts(np_arg)
   PyObject *pReturn = PyObject_CallFunctionObjArgs(pFunc, pArray, NULL);
   if (!pReturn) {
-    return FinalCounts;
+    return PredictionRC;
   }
   if (!PyArray_Check(pReturn)) {
-    std::cerr << moduleName << "." << func_name
-              << " did not return an array." << std::endl;
-    return FinalCounts;
+    DEBUG(dbgs() << moduleName << "." << func_name
+                 << " did not return an array.\n");
+    return PredictionRC;
   }
   PyArrayObject *npRet = reinterpret_cast<PyArrayObject *>(pReturn);
-  if (PyArray_NDIM(npRet) != ND - 1) {
-    std::cerr << moduleName << "." << func_name
-              << " returned array with wrong dimension." << std::endl;
-    return FinalCounts;
+  if (PyArray_NDIM(npRet) != DimsCount - 1) {
+    DEBUG(dbgs() << moduleName << "." << func_name
+                 << " returned array with wrong dimension.\n");
+    return PredictionRC;
   }
 
-  // Convert back to C++ array and print.
   int len = PyArray_SHAPE(npRet)[0];
   long double *cOutArr = reinterpret_cast<long double *>(PyArray_DATA(npRet));
-  std::cout << "Printing output array" << std::endl;
   for (int i = 0; i < len; i++) {
     FinalCounts.push_back(cOutArr[i]);
   }
-  std::cout << std::endl;
 
   Py_XDECREF(pReturn);
   Py_XDECREF(pFunc);
@@ -1157,7 +1155,7 @@ static Optional<std::vector<uint64_t>> getPredictedLinearCounts(
 
   Py_Finalize();
 
-  return FinalCounts;
+  return 0;
 }
 
 // Use prediction model to calculate supposed future profiling data
@@ -1170,14 +1168,15 @@ static std::shared_ptr<PGOUseFunc> computePredictedProfiles(
   }
 
   // Run the model, get final count with the same linearization heuristic.
-  auto PredictedLinearCountsOpt = getPredictedLinearCounts(LinearFuncCounts);
-  if (!PredictedLinearCountsOpt) {
+  std::vector<uint64_t> PredictedLinearCounts;
+  auto PredictionRet = getPredictedLinearCounts(LinearFuncCounts,
+                                                PredictedLinearCounts);
+  if (!PredictionRet) {
     // FIXME AL Log the fact of ignoring.
     // Some issue occured due predictingl, return the first PGOUseFunc
     // without even modifying it.
     return Funcs[0];
   }
-  auto PredictedLinearCounts = PredictedLinearCountsOpt.getValue();
 
   // From now on just use the copy of the first PGOUseFunc provided
   // as a blueprint.
@@ -1418,18 +1417,14 @@ static bool annotateAllFunctions(
     function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
     function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
     std::unique_ptr<IndexedInstrProfReader> InstrProfReader) {
-  auto &Ctx = M.getContext();
   std::unique_ptr<IndexedInstrProfReader> PGOReader =
       std::move(InstrProfReader);
   if (!PGOReader) {
-    Ctx.diagnose(DiagnosticInfoPGOProfile(ProfileFileName.data(),
-                                          StringRef("Cannot get PGOReader")));
+    DEBUG(dbgs() << "Cannot get current PGOReader.\n");
     return false;
   }
-  // TODO: might need to change the warning once the clang option is finalized.
   if (!PGOReader->isIRLevelProfile()) {
-    Ctx.diagnose(DiagnosticInfoPGOProfile(
-        ProfileFileName.data(), "Not an IR level instrumentation profile"));
+    DEBUG(dbgs() << "Current instrumentation profile is not an IR level one.\n");
     return false;
   }
 
@@ -1476,18 +1471,13 @@ static bool annotateAllFunctions(
     function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
     function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
     const std::vector<std::unique_ptr<IndexedInstrProfReader>> &Readers) {
-  auto &Ctx = M.getContext();
   for (auto &Reader : Readers) {
     if (!Reader) {
-      Ctx.diagnose(DiagnosticInfoPGOProfile(
-          ProfileFileName.data(), StringRef("Cannot get current PGOReader")));
+      DEBUG(dbgs() << "Cannot get current PGOReader.\n");
       return false;
     }
-    // TODO: might need to change the warning once the clang option is
-    // finalized.
     if (!Reader->isIRLevelProfile()) {
-      Ctx.diagnose(DiagnosticInfoPGOProfile(
-          ProfileFileName.data(), "Not an IR level instrumentation profile"));
+      DEBUG(dbgs() << "Current instrumentation profile is not an IR level one.\n");
       return false;
     }
   }

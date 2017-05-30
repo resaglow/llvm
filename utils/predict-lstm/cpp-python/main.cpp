@@ -39,14 +39,14 @@ int main(int argc, const char *argv[])
     }
     PyArrayObject *npArr = reinterpret_cast<PyArrayObject *>(pArray);
 
-    std::string LSTMPath = "/home/resaglow/Dev/llvm-global/predict-lstm/cpp-python";
+    std::string LSTMPath = "/home/resaglow/Dev/llvm-global/llvm-git/utils/predict-lstm/cpp-python";
     std::cout << LSTMPath << std::endl;
     PyObject* SysPath = PySys_GetObject((char *)"path");
     PyObject* PyLSTMPath = PyUnicode_FromString(LSTMPath.c_str());
     PyList_Append(SysPath, PyLSTMPath);
     Py_DECREF(PyLSTMPath);
 
-    // import mymodule.array_tutorial
+    // import mymodule.testing_func
     const char *moduleName = "mymodule";
     PyObject *pName = PyUnicode_FromString(moduleName);
     if (!pName) {
@@ -58,7 +58,7 @@ int main(int argc, const char *argv[])
         return EXIT_FAILURE;
     }
 
-    const char *func_name = "array_tutorial";
+    const char *func_name = "testing_func";
     PyObject *pFunc = PyObject_GetAttrString(pModule, func_name);
     if (!pFunc) {
         return EXIT_FAILURE;
@@ -71,7 +71,7 @@ int main(int argc, const char *argv[])
     PyObject *pArgs = PyTuple_New(1);
     PyTuple_SetItem(pArgs, 0, reinterpret_cast<PyObject*>(npArr));
 
-    // np_ret = mymodule.array_tutorial(np_arg)
+    // np_ret = mymodule.testing_func(np_arg)
     PyObject *pReturn = PyObject_CallFunctionObjArgs(pFunc, pArray, NULL);
     if (!pReturn) {
         return EXIT_FAILURE;

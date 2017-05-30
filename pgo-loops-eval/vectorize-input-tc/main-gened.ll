@@ -1,12 +1,23 @@
-; ModuleID = 'main.bc'
+; ModuleID = 'main-gened.bc'
 source_filename = "main.cpp"
 target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
+
+$__llvm_profile_raw_version = comdat any
+
+$__llvm_profile_filename = comdat any
 
 @a = local_unnamed_addr global [67108864 x i32] zeroinitializer, align 16
 @b = local_unnamed_addr global [67108864 x i32] zeroinitializer, align 16
 @c = local_unnamed_addr global [67108864 x i32] zeroinitializer, align 16
 @.str = private unnamed_addr constant [4 x i8] c"%ld\00", align 1
+@__llvm_profile_raw_version = constant i64 72057594037927940, comdat
+@__profn_main = private constant [4 x i8] c"main"
+@__profc_main = private global [2 x i64] zeroinitializer, section "__llvm_prf_cnts", align 8
+@__profd_main = private global { i64, i64, i64*, i8*, i8*, i32, [1 x i16] } { i64 -2624081020897602054, i64 29212902728, i64* getelementptr inbounds ([2 x i64], [2 x i64]* @__profc_main, i32 0, i32 0), i8* bitcast (i32 ()* @main to i8*), i8* null, i32 2, [1 x i16] zeroinitializer }, section "__llvm_prf_data", align 8
+@__llvm_prf_nm = private constant [14 x i8] c"\04\0Cx\DA\CBM\CC\CC\03\00\04\1B\01\A6", section "__llvm_prf_names"
+@llvm.used = appending global [2 x i8*] [i8* bitcast ({ i64, i64, i64*, i8*, i8*, i32, [1 x i16] }* @__profd_main to i8*), i8* getelementptr inbounds ([14 x i8], [14 x i8]* @__llvm_prf_nm, i32 0, i32 0)], section "llvm.metadata"
+@__llvm_profile_filename = constant [19 x i8] c"default_%m.profraw\00", comdat
 
 ; Function Attrs: norecurse nounwind uwtable
 define i32 @main() local_unnamed_addr #0 {
@@ -16,32 +27,39 @@ entry:
   call void @llvm.lifetime.start(i64 8, i8* nonnull %0) #3
   %call = call i32 (i8*, ...) @scanf(i8* getelementptr inbounds ([4 x i8], [4 x i8]* @.str, i64 0, i64 0), i64* nonnull %n)
   %1 = load i64, i64* %n, align 8, !tbaa !1
-  %cmp10 = icmp sgt i64 %1, 0
-  br i1 %cmp10, label %for.body.lr.ph, label %for.cond.cleanup
+  %cmp11 = icmp sgt i64 %1, 0
+  br i1 %cmp11, label %for.body.lr.ph, label %for.cond.cleanup
 
 for.body.lr.ph:                                   ; preds = %entry
   %2 = load i64, i64* %n, align 8, !tbaa !1
+  %.promoted = load i64, i64* getelementptr inbounds ([2 x i64], [2 x i64]* @__profc_main, i64 0, i64 0), align 8
   br label %for.body
 
-for.cond.cleanup.loopexit:                        ; preds = %for.body
+for.cond.for.cond.cleanup_crit_edge:              ; preds = %for.body
+  store i64 %5, i64* getelementptr inbounds ([2 x i64], [2 x i64]* @__profc_main, i64 0, i64 0), align 8
   br label %for.cond.cleanup
 
-for.cond.cleanup:                                 ; preds = %for.cond.cleanup.loopexit, %entry
+for.cond.cleanup:                                 ; preds = %for.cond.for.cond.cleanup_crit_edge, %entry
+  %pgocount = load i64, i64* getelementptr inbounds ([2 x i64], [2 x i64]* @__profc_main, i64 0, i64 1), align 8
+  %3 = add i64 %pgocount, 1
+  store i64 %3, i64* getelementptr inbounds ([2 x i64], [2 x i64]* @__profc_main, i64 0, i64 1), align 8
   call void @llvm.lifetime.end(i64 8, i8* nonnull %0) #3
   ret i32 0
 
 for.body:                                         ; preds = %for.body.lr.ph, %for.body
   %indvars.iv = phi i64 [ 0, %for.body.lr.ph ], [ %indvars.iv.next, %for.body ]
+  %4 = phi i64 [ %.promoted, %for.body.lr.ph ], [ %5, %for.body ]
+  %5 = add i64 %4, 1
   %arrayidx = getelementptr inbounds [67108864 x i32], [67108864 x i32]* @b, i64 0, i64 %indvars.iv
-  %3 = load i32, i32* %arrayidx, align 4, !tbaa !5
+  %6 = load i32, i32* %arrayidx, align 4, !tbaa !5
   %arrayidx2 = getelementptr inbounds [67108864 x i32], [67108864 x i32]* @c, i64 0, i64 %indvars.iv
-  %4 = load i32, i32* %arrayidx2, align 4, !tbaa !5
-  %add = add nsw i32 %4, %3
+  %7 = load i32, i32* %arrayidx2, align 4, !tbaa !5
+  %add = add nsw i32 %7, %6
   %arrayidx4 = getelementptr inbounds [67108864 x i32], [67108864 x i32]* @a, i64 0, i64 %indvars.iv
   store i32 %add, i32* %arrayidx4, align 4, !tbaa !5
   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1
   %cmp = icmp slt i64 %indvars.iv.next, %2
-  br i1 %cmp, label %for.body, label %for.cond.cleanup.loopexit
+  br i1 %cmp, label %for.body, label %for.cond.for.cond.cleanup_crit_edge
 }
 
 ; Function Attrs: argmemonly nounwind

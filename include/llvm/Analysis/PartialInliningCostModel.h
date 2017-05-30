@@ -28,7 +28,7 @@ struct PartInlineFuncProfCounts {
   std::vector<uint64_t> ConditionBlockCounts; 
 };
 
-static const std::string ThisPassName = "PartInlineCM"; // FIXME AL
+static const std::string ThisPassName = "PartInlineCM";
 
 struct PartialInliningCostModelPass : public ModulePass {
   static char ID;
@@ -46,11 +46,11 @@ struct PartialInliningCostModelPass : public ModulePass {
     return StringRef(ThisPassName);
   }
 
-//  PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
-
   std::map<std::string, uint64_t> getFuncFreqMap();
 
   std::map<std::string, std::vector<uint64_t>> getFuncCondProbMap();
+
+  std::map<std::string, uint64_t> getInstCountMap();
 
   virtual void getAnalysisUsage(AnalysisUsage &AU) const override;
 };
@@ -58,13 +58,14 @@ struct PartialInliningCostModelPass : public ModulePass {
 struct PartialInliningCostModelPassImpl {
   PartialInliningCostModelPassImpl(
     function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
-    function_ref<BranchProbabilityInfo *(Function &)> LookupBPI);
+    function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
+    function_ref<unsigned(Function &)> LookupInstCount);
 
-  // FIXME Pointers vs. refs
   bool collectModuleProfileHeuristics(Module &M);
 
   function_ref<BlockFrequencyInfo *(Function &)> LookupBFI;
   function_ref<BranchProbabilityInfo *(Function &)> LookupBPI;
+  function_ref<unsigned(Function &)> LookupInstCount;
 
   // Calculate block frequencies of funcs that are relevant to partially inline
   // and depths of such functions in a call stack.
@@ -85,10 +86,21 @@ struct PartialInliningCostModelPassImpl {
     std::map<const BasicBlock *, int> &BBOccurenceCounts,
     std::set<const BasicBlock *> &CurBBOccurences);
 
+  // Filter out rarely used functions.
+  void cropFuncFreq();
+  // Filter out elements of the cond prob map that are too unevenly distributed.
+  void cropFuncCondProb();
+  // Just filter funcs with too many instructions.
+  void cropInstCount();
+  // Go over all the useful data collected during profiling and apply internal
+  // heuristics.
+  void cropProfileData();
+
   // Helpers to extract useful information from profiling analysis.
   void extractBlockBreq(Function *F);
   void extractBranchProb(
     Function *F, BasicBlock *EntryBlock, unsigned SingleReturnBlockIdx);
+  void extractInstCount(Function *F);
 };
 
 } // llvm
