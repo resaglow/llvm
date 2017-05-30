@@ -82,6 +82,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <Python.h>
+#include "pyerrors.h"
+#include <numpy/arrayobject.h>
+#include <unistd.h>
 
 using namespace llvm;
 
@@ -966,7 +970,7 @@ static void setProfMetadata(Module *M, Instruction *TI,
     Weights.push_back(scaleBranchCount(ECI, Scale));
 
   DEBUG(dbgs() << "Weight is: ";
-        for (const auto &W : Weights) { dbgs() << W << " "; } 
+        for (const auto &W : Weights) { dbgs() << W << " "; }
         dbgs() << "\n";);
   TI->setMetadata(llvm::LLVMContext::MD_prof, MDB.createBranchWeights(Weights));
 }
@@ -1043,6 +1047,119 @@ void PGOUseFunc::insertLinearFuncCount(
   }
 }
 
+// Work linearized profile counts through the prediction model and provide the
+// new (predicted) ones.
+static Optional<std::vector<uint64_t>> getPredictedLinearCounts(
+    std::vector<std::vector<uint64_t>> InitialCounts) {
+  // FIXME AL Fix cerrs / missing cases.
+
+  Optional<std::vector<uint64_t>> FinalCounts = None;
+
+  // Standard procedure to call Python funcs & translate results.
+  const char ActualProgramName[] = "opt";
+  wchar_t WideProgramName[sizeof(ActualProgramName)];
+
+  mbstowcs(WideProgramName, ActualProgramName, sizeof(ActualProgramName));
+  Py_SetProgramName(programName);
+  Py_Initialize();
+  import_array();
+
+  // Build the 2D array for interacting with Python.
+  constexpr int DimsCount = 2;
+  npy_intp Dims[DimsCount] = {InitialCounts.size(), InitialCounts[0].size()};
+  long double (*cArr)[Dims[1]] = new long double[Dims[0]][Dims[1]];
+  if (!cArr) {
+    std::cerr << "Out of memory." << std::endl;
+    return FinalCounts;
+  }
+
+  // Have to copy elements manually, there's no 2D vector/array conversion.
+  for (unsigned i = 0; i < Dims[0]; i++) {
+    for (unsigned j = 0; j < Dims[1]; j++) {
+      cArr[i][j] = InitialCounts[i][j];
+    }
+  }
+
+  // Convert it to a NumPy array.
+  PyObject *pArray = PyArray_SimpleNewFromData(ND, dims, NPY_LONGDOUBLE,
+                                               reinterpret_cast<void *>(cArr));
+  if (!pArray) {
+    return FinalCounts;
+  }
+  PyArrayObject *npArr = reinterpret_cast<PyArrayObject *>(pArray);
+
+  std::string LSTMPath = "/home/resaglow/Dev/llvm-global/predict-lstm/cpp-python";
+  std::cout << LSTMPath << std::endl;
+  PyObject* SysPath = PySys_GetObject((char *)"path");
+  PyObject* PyLSTMPath = PyUnicode_FromString(LSTMPath.c_str());
+  PyList_Append(SysPath, PyLSTMPath);
+  Py_DECREF(PyLSTMPath);
+
+  // import mymodule.array_tutorial
+  const char *moduleName = "mymodule";
+  PyObject *pName = PyUnicode_FromString(moduleName);
+  if (!pName) {
+    return FinalCounts;
+  }
+  PyObject *pModule = PyImport_Import(pName);
+  Py_DECREF(pName);
+  if (!pModule) {
+    return FinalCounts;
+  }
+
+  const char *func_name = "array_tutorial";
+  PyObject *pFunc = PyObject_GetAttrString(pModule, func_name);
+  if (!pFunc) {
+    return FinalCounts;
+  }
+  if (!PyCallable_Check(pFunc)) {
+    std::cerr << moduleName << "." << func_name
+              << " is not callable." << std::endl;
+    return FinalCounts;
+  }
+
+  PyObject *pArgs = PyTuple_New(1);
+  PyTuple_SetItem(pArgs, 0, reinterpret_cast<PyObject*>(npArr));
+
+  // np_ret = mymodule.array_tutorial(np_arg)
+  PyObject *pReturn = PyObject_CallFunctionObjArgs(pFunc, pArray, NULL);
+  if (!pReturn) {
+    return FinalCounts;
+  }
+  if (!PyArray_Check(pReturn)) {
+    std::cerr << moduleName << "." << func_name
+              << " did not return an array." << std::endl;
+    return FinalCounts;
+  }
+  PyArrayObject *npRet = reinterpret_cast<PyArrayObject *>(pReturn);
+  if (PyArray_NDIM(npRet) != ND - 1) {
+    std::cerr << moduleName << "." << func_name
+              << " returned array with wrong dimension." << std::endl;
+    return FinalCounts;
+  }
+
+  // Convert back to C++ array and print.
+  int len = PyArray_SHAPE(npRet)[0];
+  long double *cOutArr = reinterpret_cast<long double *>(PyArray_DATA(npRet));
+  std::cout << "Printing output array" << std::endl;
+  for (int i = 0; i < len; i++) {
+    FinalCounts.push_back(cOutArr[i]);
+  }
+  std::cout << std::endl;
+
+  Py_XDECREF(pReturn);
+  Py_XDECREF(pFunc);
+  Py_XDECREF(pModule);
+  Py_XDECREF(pArray);
+  Py_XDECREF(pArgs);
+  delete[] cArr;
+  // FIXME AL Should npRet/cOutArr be dealloced?
+
+  Py_Finalize();
+
+  return FinalCounts;
+}
+
 // Use prediction model to calculate supposed future profiling data
 // (specifically, edge counts).
 static std::shared_ptr<PGOUseFunc> computePredictedProfiles(
@@ -1052,9 +1169,15 @@ static std::shared_ptr<PGOUseFunc> computePredictedProfiles(
     LinearFuncCounts[i] = Funcs[i]->linearizeProfileCounts();
   }
 
-  // FIXME AL Run the model, get final count with the same linearization
-  // heuristic. Stub for now.
-  auto PredictedLinearCounts = LinearFuncCounts[0];
+  // Run the model, get final count with the same linearization heuristic.
+  auto PredictedLinearCountsOpt = getPredictedLinearCounts(LinearFuncCounts);
+  if (!PredictedLinearCountsOpt) {
+    // FIXME AL Log the fact of ignoring.
+    // Some issue occured due predictingl, return the first PGOUseFunc
+    // without even modifying it.
+    return Funcs[0];
+  }
+  auto PredictedLinearCounts = PredictedLinearCountsOpt.getValue();
 
   // From now on just use the copy of the first PGOUseFunc provided
   // as a blueprint.
@@ -1268,7 +1391,6 @@ PreservedAnalyses PGOInstrumentationGen::run(Module &M,
   return PreservedAnalyses::none();
 }
 
-// FIXME AL
 static std::vector<Twine> getProfileFileNameList(
         const StringRef &ProfileFolderName) {
   std::vector<Twine> ProfileFileNameList;
@@ -1296,19 +1418,18 @@ static bool annotateAllFunctions(
     function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
     function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
     std::unique_ptr<IndexedInstrProfReader> InstrProfReader) {
-//  auto &Ctx = M.getContext();
-  // FIXME AL Do we need separate var?
+  auto &Ctx = M.getContext();
   std::unique_ptr<IndexedInstrProfReader> PGOReader =
       std::move(InstrProfReader);
   if (!PGOReader) {
-//    Ctx.diagnose(DiagnosticInfoPGOProfile(ProfileFileName.data(),
-//                                          StringRef("Cannot get PGOReader")));
+    Ctx.diagnose(DiagnosticInfoPGOProfile(ProfileFileName.data(),
+                                          StringRef("Cannot get PGOReader")));
     return false;
   }
   // TODO: might need to change the warning once the clang option is finalized.
   if (!PGOReader->isIRLevelProfile()) {
-//    Ctx.diagnose(DiagnosticInfoPGOProfile(
-//        ProfileFileName.data(), "Not an IR level instrumentation profile"));
+    Ctx.diagnose(DiagnosticInfoPGOProfile(
+        ProfileFileName.data(), "Not an IR level instrumentation profile"));
     return false;
   }
 
@@ -1355,18 +1476,18 @@ static bool annotateAllFunctions(
     function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
     function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
     const std::vector<std::unique_ptr<IndexedInstrProfReader>> &Readers) {
-//  auto &Ctx = M.getContext();
+  auto &Ctx = M.getContext();
   for (auto &Reader : Readers) {
     if (!Reader) {
-//      Ctx.diagnose(DiagnosticInfoPGOProfile(
-//          ProfileFileName.data(), StringRef("Cannot get current PGOReader")));
+      Ctx.diagnose(DiagnosticInfoPGOProfile(
+          ProfileFileName.data(), StringRef("Cannot get current PGOReader")));
       return false;
     }
     // TODO: might need to change the warning once the clang option is
     // finalized.
     if (!Reader->isIRLevelProfile()) {
-//      Ctx.diagnose(DiagnosticInfoPGOProfile(
-//          ProfileFileName.data(), "Not an IR level instrumentation profile"));
+      Ctx.diagnose(DiagnosticInfoPGOProfile(
+          ProfileFileName.data(), "Not an IR level instrumentation profile"));
       return false;
     }
   }
@@ -1395,7 +1516,6 @@ static bool annotateAllFunctions(
       Funcs[i]->populateCounters();
     }
 
-    // FIXME AL Check option for profile prediction.
     std::shared_ptr<PGOUseFunc> Func = computePredictedProfiles(Funcs);
 
     Func->setBranchWeights();
@@ -1406,7 +1526,7 @@ static bool annotateAllFunctions(
     else if (FreqAttr == PGOUseFunc::FFA_Hot)
       HotFunctions.push_back(&F);
   }
-  // Fix 1 reader variant
+  // FIXME AL Fix 1 reader variant
   M.setProfileSummary(Readers[0]->getSummary().getMD(M.getContext()));
   // Set function hotness attribute from the profile.
   // We have to apply these attributes at the end because their presence
@@ -1437,6 +1557,7 @@ static bool annotateAllFunctions(
   if (!ProfileFileName.empty()) {
     ReadersOrErrs.push_back(IndexedInstrProfReader::create(ProfileFileName));
   } else {
+    // Case for reading multiple profiles from the entire directory.
     auto ProfileFileList = getProfileFileNameList(ProfileFolderName);
     ReadersOrErrs = IndexedInstrProfReader::createProfReaderRange(
                       ProfileFileList);
