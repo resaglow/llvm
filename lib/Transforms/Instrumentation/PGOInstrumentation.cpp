@@ -72,7 +72,9 @@
 #include "llvm/ProfileData/ProfileCommon.h"
 #include "llvm/Support/BranchProbability.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JamCRC.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <algorithm>
@@ -80,6 +82,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <Python.h>
+#include "pyerrors.h"
+#include <numpy/arrayobject.h>
+#include <unistd.h>
 
 using namespace llvm;
 
@@ -102,6 +108,16 @@ static cl::opt<std::string>
                        cl::value_desc("filename"),
                        cl::desc("Specify the path of profile data file. This is"
                                 "mainly for test purpose."));
+
+// Command line option to specify the folder to read multiple profiles from.
+// All the .profdata files in a given folder will be incorporated in
+// lexicographical order.
+static cl::opt<std::string>
+    PGOTestProfileFolder("pgo-test-profile-folder", cl::init(""), cl::Hidden,
+                         cl::value_desc("folder name"),
+                         cl::desc("Specify the path of profile data folder."
+                                  "Profdata files will be used in lexicographical"
+                                  "order"));
 
 // Command line option to disable value profiling. The default is false:
 // i.e. value profiling is enabled by default. This is for debug purpose.
@@ -225,8 +241,12 @@ public:
   // Provide the profile filename as the parameter.
   PGOInstrumentationUseLegacyPass(std::string Filename = "")
       : ModulePass(ID), ProfileFileName(std::move(Filename)) {
+    if (!PGOTestProfileFile.empty() && !PGOTestProfileFolder.empty())
+    {} // FIXME AL Fail gracefully for a given pass.
     if (!PGOTestProfileFile.empty())
       ProfileFileName = PGOTestProfileFile;
+    if (!PGOTestProfileFolder.empty())
+      ProfileFolderName = PGOTestProfileFolder;
     initializePGOInstrumentationUseLegacyPassPass(
         *PassRegistry::getPassRegistry());
   }
@@ -235,6 +255,7 @@ public:
 
 private:
   std::string ProfileFileName;
+  std::string ProfileFolderName;
 
   bool runOnModule(Module &M) override;
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -650,6 +671,13 @@ public:
   // Populate the counts for all BBs.
   void populateCounters();
 
+  // Linearization utility necessary for profiling info prediction.
+  std::vector<uint64_t> linearizeProfileCounts() const;
+
+  // Inserter for predicted counts returning another PGOUseFunc instance
+  // with profile counts updated.
+  void insertLinearFuncCount(const std::vector<uint64_t> &PredictedCounts);
+
   // Set the branch weights based on the count values.
   void setBranchWeights();
 
@@ -938,13 +966,223 @@ static void setProfMetadata(Module *M, Instruction *TI,
   assert(MaxCount > 0 && "Bad max count");
   uint64_t Scale = calculateCountScale(MaxCount);
   SmallVector<unsigned, 4> Weights;
-  for (const auto &ECI : EdgeCounts)
+  for (const auto &ECI : EdgeCounts) // FIXME AL Why ECI?
     Weights.push_back(scaleBranchCount(ECI, Scale));
 
   DEBUG(dbgs() << "Weight is: ";
-        for (const auto &W : Weights) { dbgs() << W << " "; } 
+        for (const auto &W : Weights) { dbgs() << W << " "; }
         dbgs() << "\n";);
   TI->setMetadata(llvm::LLVMContext::MD_prof, MDB.createBranchWeights(Weights));
+}
+
+// Linearize profile counts for a given PGOUseFunc containing a representation
+// of a function and its profiling info.
+std::vector<uint64_t> PGOUseFunc::linearizeProfileCounts() const {
+  std::vector<uint64_t> LinearCounts;
+  for (auto &BB : F) {
+    TerminatorInst *TI = BB.getTerminator();
+
+    if (TI->getNumSuccessors() < 2)
+      continue;
+    if (!isa<BranchInst>(TI) && !isa<SwitchInst>(TI))
+      continue;
+    if (getBBInfo(&BB).CountValue == 0)
+      continue;
+
+    // We have a non-zero Branch BB.
+    const UseBBInfo &BBCountInfo = getBBInfo(&BB);
+    unsigned Size = BBCountInfo.OutEdges.size();
+    std::vector<uint64_t> EdgeCounts(Size, 0);
+    for (unsigned s = 0; s < Size; s++) {
+      const PGOUseEdge *E = BBCountInfo.OutEdges[s];
+      const BasicBlock *SrcBB = E->SrcBB;
+      const BasicBlock *DestBB = E->DestBB;
+      if (DestBB == nullptr)
+        continue;
+      unsigned SuccNum = GetSuccessorNumber(SrcBB, DestBB);
+      uint64_t EdgeCount = E->CountValue;
+      EdgeCounts[SuccNum] = EdgeCount;
+    }
+    LinearCounts.insert(LinearCounts.end(),
+                        EdgeCounts.begin(),
+                        EdgeCounts.end());
+  }
+  return LinearCounts;
+}
+
+void PGOUseFunc::insertLinearFuncCount(
+    const std::vector<uint64_t> &PredictedCounts) {
+  // Fetch the copy of the current func so we could update profile count on it.
+  int CurMaxEdgeGlobalIndex = 0;
+  for (auto &BB : F) {
+    TerminatorInst *TI = BB.getTerminator();
+
+    if (TI->getNumSuccessors() < 2)
+      continue;
+    if (!isa<BranchInst>(TI) && !isa<SwitchInst>(TI))
+      continue;
+    if (getBBInfo(&BB).CountValue == 0)
+      continue;
+
+    // We have a non-zero Branch BB.
+    const UseBBInfo &BBCountInfo = getBBInfo(&BB);
+    unsigned Size = BBCountInfo.OutEdges.size();
+
+    unsigned MinEdgeIndex = CurMaxEdgeGlobalIndex,
+             MaxEdgeIndex = CurMaxEdgeGlobalIndex + Size;
+
+    // TODO: Improve for it to not be quadratic.
+    for (unsigned i = MinEdgeIndex; i < MaxEdgeIndex; i++)
+      for (unsigned s = 0; s < Size; s++) {
+        PGOUseEdge *E = BBCountInfo.OutEdges[s];
+        const BasicBlock *SrcBB = E->SrcBB;
+        const BasicBlock *DestBB = E->DestBB;
+        if (DestBB == nullptr)
+          continue;
+        unsigned SuccNum = GetSuccessorNumber(SrcBB, DestBB);
+        if (i == SuccNum)
+          E->CountValue = PredictedCounts[i];
+      }
+  }
+}
+
+// Work linearized profile counts through the prediction model and provide the
+// new (predicted) ones.
+// Due to C++/Python API we HAVE to use pointer return type. o_o.
+static void *getPredictedLinearCounts(
+    const std::vector<std::vector<uint64_t>> &InitialCounts,
+    std::vector<uint64_t> &FinalCounts) {
+  constexpr void *PredictionRC = NULL;
+
+  // FIXME AL Fix cerrs / missing cases.
+
+  // Standard procedure to call Python funcs & translate results.
+  const char ActualProgramName[] = "opt";
+  wchar_t WideProgramName[sizeof(ActualProgramName)];
+
+  mbstowcs(WideProgramName, ActualProgramName, sizeof(ActualProgramName));
+  Py_SetProgramName(WideProgramName);
+  Py_Initialize();
+  import_array();
+
+  // Build the 2D array for interacting with Python.
+  constexpr int DimsCount = 2;
+  npy_intp Dims[DimsCount] = {static_cast<npy_intp>(InitialCounts.size()),
+                              static_cast<npy_intp>(InitialCounts[0].size())};
+
+  int Dim1 = InitialCounts.size();
+  int Dim2 = InitialCounts[0].size();
+  long long *cArr = new long long[Dim1 * Dim2];
+
+  // Have to copy elements manually, there's no 2D vector/array conversion.
+  for (int i = 0; i < Dims[0]; i++) {
+    for (int j = 0; j < Dims[1]; j++) {
+      cArr[i * Dim1 + j] = InitialCounts[i][j];
+    }
+  }
+
+  // Convert it to a NumPy array.
+  PyObject *pArray = PyArray_SimpleNewFromData(DimsCount, Dims, NPY_LONGDOUBLE,
+                                               reinterpret_cast<void *>(cArr));
+  if (!pArray) {
+    return PredictionRC;
+  }
+  PyArrayObject *npArr = reinterpret_cast<PyArrayObject *>(pArray);
+
+  // FIXME AL Get rid of global path
+  std::string LSTMPath = "/home/resaglow/Dev/llvm-global/llvm-git/utils/predict-lstm/lstm";
+  PyObject* SysPath = PySys_GetObject(const_cast<char *>("path"));
+  PyObject* PyLSTMPath = PyUnicode_FromString(LSTMPath.c_str());
+  PyList_Append(SysPath, PyLSTMPath);
+  Py_DECREF(PyLSTMPath);
+
+  // import lstm.predict_counts
+  const char *moduleName = "lstm";
+  PyObject *pName = PyUnicode_FromString(moduleName);
+  if (!pName) {
+    return PredictionRC;
+  }
+  PyObject *pModule = PyImport_Import(pName);
+  Py_DECREF(pName);
+  if (!pModule) {
+    return PredictionRC;
+  }
+
+  const char *func_name = "predict_counts";
+  PyObject *pFunc = PyObject_GetAttrString(pModule, func_name);
+  if (!pFunc) {
+    return PredictionRC;
+  }
+  if (!PyCallable_Check(pFunc)) {
+    DEBUG(dbgs() << moduleName << "." << func_name
+                 << " is not callable.\n");
+    return PredictionRC;
+  }
+
+  PyObject *pArgs = PyTuple_New(1);
+  PyTuple_SetItem(pArgs, 0, reinterpret_cast<PyObject*>(npArr));
+
+  // np_ret = lstm.predict_counts(np_arg)
+  PyObject *pReturn = PyObject_CallFunctionObjArgs(pFunc, pArray, NULL);
+  if (!pReturn) {
+    return PredictionRC;
+  }
+  if (!PyArray_Check(pReturn)) {
+    DEBUG(dbgs() << moduleName << "." << func_name
+                 << " did not return an array.\n");
+    return PredictionRC;
+  }
+  PyArrayObject *npRet = reinterpret_cast<PyArrayObject *>(pReturn);
+  if (PyArray_NDIM(npRet) != DimsCount - 1) {
+    DEBUG(dbgs() << moduleName << "." << func_name
+                 << " returned array with wrong dimension.\n");
+    return PredictionRC;
+  }
+
+  int len = PyArray_SHAPE(npRet)[0];
+  long double *cOutArr = reinterpret_cast<long double *>(PyArray_DATA(npRet));
+  for (int i = 0; i < len; i++) {
+    FinalCounts.push_back(cOutArr[i]);
+  }
+
+  Py_XDECREF(pReturn);
+  Py_XDECREF(pFunc);
+  Py_XDECREF(pModule);
+  Py_XDECREF(pArray);
+  Py_XDECREF(pArgs);
+  delete[] cArr;
+  // FIXME AL Should npRet/cOutArr be dealloced?
+
+  Py_Finalize();
+
+  return 0;
+}
+
+// Use prediction model to calculate supposed future profiling data
+// (specifically, edge counts).
+static std::shared_ptr<PGOUseFunc> computePredictedProfiles(
+    const std::vector<std::shared_ptr<PGOUseFunc>> &Funcs) {
+  std::vector<std::vector<uint64_t>> LinearFuncCounts;
+  for (unsigned i = 0; i < Funcs.size(); i++) {
+    LinearFuncCounts[i] = Funcs[i]->linearizeProfileCounts();
+  }
+
+  // Run the model, get final count with the same linearization heuristic.
+  std::vector<uint64_t> PredictedLinearCounts;
+  auto PredictionRet = getPredictedLinearCounts(LinearFuncCounts,
+                                                PredictedLinearCounts);
+  if (!PredictionRet) {
+    // FIXME AL Log the fact of ignoring.
+    // Some issue occured due predictingl, return the first PGOUseFunc
+    // without even modifying it.
+    return Funcs[0];
+  }
+
+  // From now on just use the copy of the first PGOUseFunc provided
+  // as a blueprint.
+  auto ResultingFunc = Funcs[0];
+  ResultingFunc->insertLinearFuncCount(PredictedLinearCounts);
+  return ResultingFunc;
 }
 
 // Assign the scaled count values to the BB with multiple out edges.
@@ -1152,33 +1390,41 @@ PreservedAnalyses PGOInstrumentationGen::run(Module &M,
   return PreservedAnalyses::none();
 }
 
-static bool annotateAllFunctions(
-    Module &M, StringRef ProfileFileName,
-    function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
-    function_ref<BlockFrequencyInfo *(Function &)> LookupBFI) {
-  DEBUG(dbgs() << "Read in profile counters: ");
-  auto &Ctx = M.getContext();
-  // Read the counter array from file.
-  auto ReaderOrErr = IndexedInstrProfReader::create(ProfileFileName);
-  if (Error E = ReaderOrErr.takeError()) {
-    handleAllErrors(std::move(E), [&](const ErrorInfoBase &EI) {
-      Ctx.diagnose(
-          DiagnosticInfoPGOProfile(ProfileFileName.data(), EI.message()));
-    });
-    return false;
+static std::vector<Twine> getProfileFileNameList(
+        const StringRef &ProfileFolderName) {
+  std::vector<Twine> ProfileFileNameList;
+  // Load each of the module files.
+  std::error_code EC;
+  for (llvm::sys::fs::directory_iterator D(ProfileFolderName, EC), DEnd;
+       D != DEnd && !EC;
+       D.increment(EC)) {
+    // If this isn't a profdata file, we don't care.
+    if (llvm::sys::path::extension(D->path()) != ".profdata") {
+      continue;
+    }
+
+    ProfileFileNameList.push_back(D->path());
   }
 
+  if (EC)
+    ProfileFileNameList.clear();
+
+  return ProfileFileNameList;
+}
+
+static bool annotateAllFunctions(
+    Module &M,
+    function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
+    function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
+    std::unique_ptr<IndexedInstrProfReader> InstrProfReader) {
   std::unique_ptr<IndexedInstrProfReader> PGOReader =
-      std::move(ReaderOrErr.get());
+      std::move(InstrProfReader);
   if (!PGOReader) {
-    Ctx.diagnose(DiagnosticInfoPGOProfile(ProfileFileName.data(),
-                                          StringRef("Cannot get PGOReader")));
+    DEBUG(dbgs() << "Cannot get current PGOReader.\n");
     return false;
   }
-  // TODO: might need to change the warning once the clang option is finalized.
   if (!PGOReader->isIRLevelProfile()) {
-    Ctx.diagnose(DiagnosticInfoPGOProfile(
-        ProfileFileName.data(), "Not an IR level instrumentation profile"));
+    DEBUG(dbgs() << "Current instrumentation profile is not an IR level one.\n");
     return false;
   }
 
@@ -1220,6 +1466,119 @@ static bool annotateAllFunctions(
   return true;
 }
 
+static bool annotateAllFunctions(
+    Module &M,
+    function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
+    function_ref<BlockFrequencyInfo *(Function &)> LookupBFI,
+    const std::vector<std::unique_ptr<IndexedInstrProfReader>> &Readers) {
+  for (auto &Reader : Readers) {
+    if (!Reader) {
+      DEBUG(dbgs() << "Cannot get current PGOReader.\n");
+      return false;
+    }
+    if (!Reader->isIRLevelProfile()) {
+      DEBUG(dbgs() << "Current instrumentation profile is not an IR level one.\n");
+      return false;
+    }
+  }
+
+  std::unordered_multimap<Comdat *, GlobalValue *> ComdatMembers;
+  collectComdatMembers(M, ComdatMembers);
+  std::vector<Function *> HotFunctions;
+  std::vector<Function *> ColdFunctions;
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    auto *BPI = LookupBPI(F);
+    auto *BFI = LookupBFI(F);
+
+    std::vector<std::shared_ptr<PGOUseFunc>> Funcs;
+    for (unsigned i = 0; i < Readers.size(); i++) {
+      std::shared_ptr<PGOUseFunc> FuncPtr(
+            new PGOUseFunc(F, &M, ComdatMembers, BPI, BFI));
+      Funcs.push_back(std::move(FuncPtr));
+    }
+
+    for (unsigned i = 0; i < Funcs.size(); i++) {
+      if (!Funcs[i]->readCounters(Readers[i].get()))
+        continue;
+
+      Funcs[i]->populateCounters();
+    }
+
+    std::shared_ptr<PGOUseFunc> Func = computePredictedProfiles(Funcs);
+
+    Func->setBranchWeights();
+    Func->annotateIndirectCallSites();
+    PGOUseFunc::FuncFreqAttr FreqAttr = Func->getFuncFreqAttr();
+    if (FreqAttr == PGOUseFunc::FFA_Cold)
+      ColdFunctions.push_back(&F);
+    else if (FreqAttr == PGOUseFunc::FFA_Hot)
+      HotFunctions.push_back(&F);
+  }
+  // FIXME AL Fix 1 reader variant
+  M.setProfileSummary(Readers[0]->getSummary().getMD(M.getContext()));
+  // Set function hotness attribute from the profile.
+  // We have to apply these attributes at the end because their presence
+  // can affect the BranchProbabilityInfo of any callers, resulting in an
+  // inconsistent MST between prof-gen and prof-use.
+  for (auto &F : HotFunctions) {
+    F->addFnAttr(llvm::Attribute::InlineHint);
+    DEBUG(dbgs() << "Set inline attribute to function: " << F->getName()
+                 << "\n");
+  }
+  for (auto &F : ColdFunctions) {
+    F->addFnAttr(llvm::Attribute::Cold);
+    DEBUG(dbgs() << "Set cold attribute to function: " << F->getName() << "\n");
+  }
+  return true;
+}
+
+static bool annotateAllFunctions(
+    Module &M,
+    StringRef ProfileFileName, StringRef ProfileFolderName,
+    function_ref<BranchProbabilityInfo *(Function &)> LookupBPI,
+    function_ref<BlockFrequencyInfo *(Function &)> LookupBFI) {
+  DEBUG(dbgs() << "Read in profile counters: ");
+  auto &Ctx = M.getContext();
+
+  // Read the counter array from file or a list of files in specified dir.
+  std::vector<Expected<std::unique_ptr<IndexedInstrProfReader>>> ReadersOrErrs;
+  if (!ProfileFileName.empty()) {
+    ReadersOrErrs.push_back(IndexedInstrProfReader::create(ProfileFileName));
+  } else {
+    // Case for reading multiple profiles from the entire directory.
+    auto ProfileFileList = getProfileFileNameList(ProfileFolderName);
+    ReadersOrErrs = IndexedInstrProfReader::createProfReaderRange(
+                      ProfileFileList);
+  }
+
+  auto isError = false;
+  for (auto &ReaderOrErr : ReadersOrErrs) {
+    if (Error E = ReaderOrErr.takeError()) {
+      handleAllErrors(std::move(E), [&](const ErrorInfoBase &EI) {
+        Ctx.diagnose(
+            DiagnosticInfoPGOProfile(ProfileFileName.data(), EI.message()));
+      });
+      isError = true;
+    }
+  }
+  if (isError)
+    return false;
+
+  if (ReadersOrErrs.size() == 1)
+    return annotateAllFunctions(M, LookupBPI, LookupBFI,
+                                std::move(ReadersOrErrs[0].get()));
+  else {
+    std::vector<std::unique_ptr<IndexedInstrProfReader>> RealReadersOrErrs;
+    for (auto &ReaderOrErr : ReadersOrErrs) {
+      RealReadersOrErrs.push_back(std::move(ReaderOrErr.get()));
+    }
+
+    return annotateAllFunctions(M, LookupBPI, LookupBFI, RealReadersOrErrs);
+  }
+}
+
 PGOInstrumentationUse::PGOInstrumentationUse(std::string Filename)
     : ProfileFileName(std::move(Filename)) {
   if (!PGOTestProfileFile.empty())
@@ -1238,7 +1597,9 @@ PreservedAnalyses PGOInstrumentationUse::run(Module &M,
     return &FAM.getResult<BlockFrequencyAnalysis>(F);
   };
 
-  if (!annotateAllFunctions(M, ProfileFileName, LookupBPI, LookupBFI))
+  if (!annotateAllFunctions(M,
+                            ProfileFileName, ProfileFolderName,
+                            LookupBPI, LookupBFI))
     return PreservedAnalyses::all();
 
   return PreservedAnalyses::none();
@@ -1255,5 +1616,5 @@ bool PGOInstrumentationUseLegacyPass::runOnModule(Module &M) {
     return &this->getAnalysis<BlockFrequencyInfoWrapperPass>(F).getBFI();
   };
 
-  return annotateAllFunctions(M, ProfileFileName, LookupBPI, LookupBFI);
+  return annotateAllFunctions(M, ProfileFileName, ProfileFolderName, LookupBPI, LookupBFI);
 }

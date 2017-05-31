@@ -34,6 +34,7 @@
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/PartialInliningCostModel.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionAliasAnalysis.h"
 #include "llvm/IR/Constants.h"
@@ -362,6 +363,8 @@ struct LCSSAWrapperPass : public FunctionPass {
     // This is needed to perform LCSSA verification inside LPPassManager
     AU.addRequired<LCSSAVerificationPass>();
     AU.addPreserved<LCSSAVerificationPass>();
+
+    AU.addPreserved<PartialInliningCostModelPass>();
   }
 };
 }

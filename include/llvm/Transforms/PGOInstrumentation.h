@@ -33,6 +33,7 @@ public:
 
 private:
   std::string ProfileFileName;
+  std::string ProfileFolderName;
 };
 
 /// The indirect function call promotion pass.

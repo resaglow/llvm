@@ -21,6 +21,7 @@
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/LoopUnrollAnalyzer.h"
 #include "llvm/Analysis/OptimizationDiagnosticInfo.h"
+#include "llvm/Analysis/PartialInliningCostModel.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/DataLayout.h"
@@ -41,6 +42,11 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll"
+
+static cl::opt<unsigned> UnrollOptForSize(
+    "loop-unroll-opt-for-size", cl::init(0), cl::Hidden,
+    cl::desc("Set the degree to which loop unroll should optimize for "
+             "code size"));
 
 static cl::opt<unsigned>
     UnrollThreshold("unroll-threshold", cl::Hidden,
@@ -908,12 +914,19 @@ static bool computeUnrollCount(
   DEBUG(dbgs() << "  partially unrolling with count: " << UP.Count << "\n");
   if (UP.Count < 2)
     UP.Count = 0;
+
+  // If applying perf/size balancing, update the count correspondingly.
+  if (UnrollOptForSize) {
+    UP.Count *= UnrollOptForSize / 100.0;
+  }
+
   return ExplicitUnroll;
 }
 
 static bool tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
                             ScalarEvolution *SE, const TargetTransformInfo &TTI,
                             AssumptionCache &AC, OptimizationRemarkEmitter &ORE,
+                            PartialInliningCostModelPass &PICM,
                             bool PreserveLCSSA,
                             Optional<unsigned> ProvidedCount,
                             Optional<unsigned> ProvidedThreshold,
@@ -929,6 +942,10 @@ static bool tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI,
         dbgs() << "  Not unrolling loop which is not in loop-simplify form.\n");
     return false;
   }
+
+  // Don't even try to unroll if the cost model showed this cost doesn't deserve it.
+  if (PICM.isFuncBad(F))
+    return false;
 
   unsigned NumInlineCandidates;
   bool NotDuplicatable;
@@ -1068,7 +1085,9 @@ public:
     OptimizationRemarkEmitter ORE(&F);
     bool PreserveLCSSA = mustPreserveAnalysisID(LCSSAID);
 
-    return tryToUnrollLoop(L, DT, LI, SE, TTI, AC, ORE, PreserveLCSSA,
+    auto &PICM = getAnalysis<PartialInliningCostModelPass>(); // getPICM?
+
+    return tryToUnrollLoop(L, DT, LI, SE, TTI, AC, ORE, PICM, PreserveLCSSA,
                            ProvidedCount, ProvidedThreshold,
                            ProvidedAllowPartial, ProvidedRuntime,
                            ProvidedUpperBound);
@@ -1080,6 +1099,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<AssumptionCacheTracker>();
     AU.addRequired<TargetTransformInfoWrapperPass>();
+    AU.addRequired<PartialInliningCostModelPass>();
     // FIXME: Loop passes are required to preserve domtree, and for now we just
     // recreate dom info if anything gets unrolled.
     getLoopAnalysisUsage(AU);

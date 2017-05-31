@@ -51,6 +51,7 @@
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/PartialInliningCostModel.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionAliasAnalysis.h"
 #include "llvm/IR/CFG.h"
@@ -781,6 +782,7 @@ namespace {
       AU.addPreservedID(LCSSAID);
       AU.addPreserved<DependenceAnalysisWrapperPass>();
       AU.addPreservedID(BreakCriticalEdgesID);  // No critical edges added.
+      AU.addPreserved<PartialInliningCostModelPass>();
     }
 
     /// verifyAnalysis() - Verify LoopSimplifyForm's guarantees.
