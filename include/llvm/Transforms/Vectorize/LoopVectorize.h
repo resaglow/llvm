@@ -86,6 +86,7 @@ struct LoopVectorizePass : public PassInfoMixin<LoopVectorizePass> {
   AssumptionCache *AC;
   std::function<const LoopAccessInfo &(Loop &)> *GetLAA;
   OptimizationRemarkEmitter *ORE;
+  bool IsFuncBadPICM;
 
   BlockFrequency ColdEntryFreq;
 

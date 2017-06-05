@@ -94,14 +94,28 @@ static std::map<std::string, std::vector<uint64_t>> FuncCondProbMap;
 // Number of instructions for each map instance.
 static std::map<std::string, uint64_t> InstCountMap;
 
+// Set of funcs that are potentially to be excluded from size-increasing loop
+// optmizations.
+static std::set<std::string> LoopOptBadFuncSet;
+
 std::map<std::string, uint64_t>
 PartialInliningCostModelPass::getFuncFreqMap() {
   return FuncFreqMap;
 }
 
+void PartialInliningCostModelPass::
+addFFMEntry(std::string Func, uint64_t FreqVal) {
+  FuncFreqMap[Func] = FreqVal;
+}
+
 std::map<std::string, std::vector<uint64_t>>
 PartialInliningCostModelPass::getFuncCondProbMap() {
   return FuncCondProbMap;
+}
+
+void PartialInliningCostModelPass::
+addFCPMEntry(std::string Func, uint64_t Val) {
+  FuncCondProbMap[Func] = Val;
 }
 
 std::map<std::string, uint64_t>
@@ -210,6 +224,9 @@ bool PartialInliningCostModelPassImpl::collectModuleProfileHeuristics(
   // To finalize, applying heuristics to squeeze profile data maps.
   cropProfileData();
 
+  // Create a set of bad loop opt functions
+  generateLoopOptBadFuncSet();
+
   return false;
 }
 
@@ -225,7 +242,7 @@ void PartialInliningCostModelPassImpl::cropFuncFreq() {
                          [](const std::pair<const std::string, uint64_t> &l,
                             const std::pair<const std::string, uint64_t> &r)
                          {
-                             return l.second > r.second;
+                             return l.second < r.second;
                          });
 
   // TODO AL Really inefficient.
@@ -254,7 +271,7 @@ void PartialInliningCostModelPassImpl::cropFuncCondProb() {
           [](const std::pair<std::string,
                              std::vector<uint64_t>> &entry) {
             return *std::max_element(entry.second.begin(),
-                                     entry.second.end()) > FuncCondProbThreshold;
+                                     entry.second.end()) < FuncCondProbThreshold;
           });
 }
 
@@ -262,14 +279,47 @@ void PartialInliningCostModelPassImpl::cropInstCount() {
   constexpr unsigned InstCountThreshold = 50;
   eraseIf(InstCountMap,
           [](const std::pair<std::string, uint64_t> &entry) {
-            return entry.second > InstCountThreshold;
+            return entry.second < InstCountThreshold;
           });
 }
 
+// Leave only the bad funcs in the corresponding maps
 void PartialInliningCostModelPassImpl::cropProfileData() {
   cropFuncFreq();
   cropFuncCondProb();
   cropInstCount();
+}
+
+template <typename T>
+std::set<T> intersect_n(std::initializer_list<std::set<T>> Args) {
+  if (Args.size() == 0) return std::set<T>();
+  std::set<T> Result = Args[0];
+  for (auto &Arg : Args) {
+    // TODO: remove copy if possible
+    auto Intersection = Result;
+    std::set_intersection(Result.begin(), Result.end(),
+                          Arg.begin(), Arg.end(),
+                          std::back_inserter(Intersection));
+    Result = Intersection;
+  }
+  return Result;
+}
+
+void PartialInliningCostModelPassImpl::generateLoopOptBadFuncSet() {
+  // Initialize all the keys
+  std::set<std::string> FFMKeys, FCPMKeys, InstCountKeys;
+  for (auto &pair : FuncFreqMap)
+    FFMKeys.insert(pair.first);
+  for (auto &pair : FuncCondProbMap)
+    FFMKeys.insert(pair.first);
+  for (auto &pair : InstCountMap)
+    FFMKeys.insert(pair.first);
+
+  LoopOptBadFuncSet = intersect_n({FFMKeys, FCPMKeys, InstCountKeys});
+}
+
+bool PartialInliningCostModelPassImpl::isFuncBad(Function &F) {
+  return LoopOptBadFuncSet.find(F) != LoopOptBadFuncSet.end();
 }
 
 void PartialInliningCostModelPassImpl::extractBlockBreq(Function *F) {
@@ -384,21 +434,22 @@ bool PartialInliningCostModelPass::runOnModule(Module &M) {
   if (skipModule(M))
     return false;
 
-  return false;
-//  auto LookupBFI = [this](Function &F) {
-//    return &this->getAnalysis<BlockFrequencyInfoWrapperPass>(F).getBFI();
-//  };
+  auto LookupBFI = [this](Function &F) {
+    return &this->getAnalysis<BlockFrequencyInfoWrapperPass>(F).getBFI();
+  };
 
-//  auto LookupBPI = [this](Function &F) {
-//    return &this->getAnalysis<BranchProbabilityInfoWrapperPass>(F).getBPI();
-//  };
+  auto LookupBPI = [this](Function &F) {
+    return &this->getAnalysis<BranchProbabilityInfoWrapperPass>(F).getBPI();
+  };
 
-//  auto LookupInstCount = [this](Function &F) {
-//    return this->getAnalysis<InstCount>(F).getTotalInstCount();
-//  };
+  auto LookupInstCount = [this](Function &F) {
+    return this->getAnalysis<InstCount>(F).getTotalInstCount();
+  };
 
-//  return PartialInliningCostModelPassImpl(LookupBFI, LookupBPI, LookupInstCount)
-//      .collectModuleProfileHeuristics(M);
+  if (!Impl)
+    Impl = PartialInliningCostModelPassImpl(LookupBFI, LookupBPI, LookupInstCount);
+
+  return Impl.collectModuleProfileHeuristics(M);
 }
 
 PreservedAnalyses PartialInliningCostModelPass::

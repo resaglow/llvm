@@ -81,6 +81,7 @@ private:
       std::vector<BasicBlock *> &ReachableBlocks,
       std::set<BasicBlock *> &ReachableBlocksSet);
 };
+
 struct PartialInlinerLegacyPass : public ModulePass {
   static char ID; // Pass identification, replacement for typeid
   PartialInlinerLegacyPass() : ModulePass(ID) {
@@ -309,6 +310,10 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionSeparate(
     ExtractedFunctions.push_back(
         CodeExtractor(ToExtract, &DT, /*AggregateArgs*/ false, &BFI, &BPI)
             .extractCodeRegion());
+
+    PICM->setFFM(
+      ExtractedFunctions.back()->getName(),
+      PICM->getFuncFreqMap()[F->getName()] * PICM->getFuncCondProbMap()[F->getName()]);
   }
 
   // Inline the top-level if test into all callers.
@@ -330,23 +335,29 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunctionSeparate(
 
 // FIXME AL Integrate optionals
 std::vector<Function *> PartialInlinerImpl::unswitchFunction(Function *F) {
+  std::vector<Function *> UnswitchedFuncsStub;
+
   // First, verify that this function is an unswitching candidate...
   BasicBlock *EntryBlock = &F->front();
   TerminatorInst *Term = EntryBlock->getTerminator();
   BranchInst *BR = dyn_cast<BranchInst>(Term);
   SwitchInst *SW = dyn_cast<SwitchInst>(Term);
   if ((!BR || BR->isUnconditional()) && !SW)
-    return std::vector<Function *>(); // FIXME AL Refactor.
+    return UnswitchedFuncsStub;
 
   if (!checkSuccessorBranchesIndependence(successors(EntryBlock)))
-    return std::vector<Function *>();
+    return UnswitchedFuncsStub;
+
+  // The function is not suitable for opts based on cost model, stop unswitching.
+  if (isFuncBad)
+    UnswitchedFuncsStub();
 
   std::vector<BasicBlock *> ReturnBlocks;
   std::vector<BasicBlock *> NonReturnBlocks;
   succ_range &&succs = successors(EntryBlock);
   for (BasicBlock *BB : succs) {
     if (searchForReachableBB(BB, EntryBlock)) {
-      return std::vector<Function *>();
+      return UnswitchedFuncsStub;
     }
     // Check for independency for a branch / switch case.
     if (isa<ReturnInst>(BB->getTerminator())) {
@@ -358,7 +369,7 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunction(Function *F) {
 
   if (ReturnBlocks.size() != 1 &&
       ReturnBlocks.size() != (size_t)std::distance(succs.begin(), succs.end()))
-    return std::vector<Function *>();
+    return UnswitchedFuncsStub;
 
   // By the time we get here we're sure it's an unswitching candidate.
 
@@ -370,7 +381,7 @@ std::vector<Function *> PartialInlinerImpl::unswitchFunction(Function *F) {
              (size_t)std::distance(succs.begin(), succs.end())) {
     return unswitchFunctionSeparate(F, EntryBlock, ReturnBlocks);
   } else {
-    return std::vector<Function *>();
+    return UnswitchedFuncsStub;
   }
 }
 

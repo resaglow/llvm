@@ -30,8 +30,11 @@ struct PartInlineFuncProfCounts {
 
 static const std::string ThisPassName = "PartInlineCM";
 
+class PartialInliningCostModelPassImpl;
+
 struct PartialInliningCostModelPass : public ModulePass {
   static char ID;
+  PartialInliningCostModelPassImpl Impl;
 
   PartialInliningCostModelPass() : ModulePass(ID) {
     initializePartialInliningCostModelPassPass(
@@ -47,10 +50,14 @@ struct PartialInliningCostModelPass : public ModulePass {
   }
 
   std::map<std::string, uint64_t> getFuncFreqMap();
+  void addFFMEntry(std::string Func, uint64_t FreqVal);
 
   std::map<std::string, std::vector<uint64_t>> getFuncCondProbMap();
+  void addFCPMEntry(std::string Func, const std::vector<uint64_t> &Val);
 
   std::map<std::string, uint64_t> getInstCountMap();
+
+  bool isFuncBad(Function &F) { return Impl.isFuncBad(F); }
 
   virtual void getAnalysisUsage(AnalysisUsage &AU) const override;
 };
@@ -95,6 +102,14 @@ struct PartialInliningCostModelPassImpl {
   // Go over all the useful data collected during profiling and apply internal
   // heuristics.
   void cropProfileData();
+
+  // Generate a set of functions to be excluded from size-increasing loop
+  // optimizations.
+  void generateLoopOptBadFuncSet();
+
+  // Check whether a given func is unsuitable for optimizations based on this
+  // cost model.
+  bool isFuncBad(Function &F);
 
   // Helpers to extract useful information from profiling analysis.
   void extractBlockBreq(Function *F);

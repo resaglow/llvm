@@ -1864,9 +1864,15 @@ public:
                              AssumptionCache *AC,
                              OptimizationRemarkEmitter *ORE, const Function *F,
                              const LoopVectorizeHints *Hints,
-                             BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI)
+                             BlockFrequencyInfo *BFI, BranchProbabilityInfo *BPI,
+                             std::map<std::string, uint64_t> &FFM,
+                             std::map<std::string, uint64_t> &InstCount,
+                             bool IsFuncBadPICM_)
       : TheLoop(L), PSE(PSE), LI(LI), Legal(Legal), TTI(TTI), TLI(TLI), DB(DB),
-        AC(AC), ORE(ORE), TheFunction(F), Hints(Hints), BFI(BFI), BPI(BPI) {}
+        AC(AC), ORE(ORE), TheFunction(F), Hints(Hints), BFI(BFI), BPI(BPI),
+        IsFuncBadPICM(IsFuncBadPICM_) {}
+
+  bool IsFuncBadPICM;
 
   /// Information about vectorization costs
   struct VectorizationFactor {
@@ -2137,10 +2143,11 @@ struct LoopVectorize : public FunctionPass {
     auto *DB = &getAnalysis<DemandedBitsWrapperPass>().getDemandedBits();
     auto *ORE = &getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
 
-    auto PIFFM =
-        getAnalysis<PartialInliningCostModelPass>().getFuncFreqMap();
-    auto PIFCPM =
-        getAnalysis<PartialInliningCostModelPass>().getFuncCondProbMap();
+    auto PICM = getAnalysis<PartialInliningCostModelPass>();
+    auto PIFFM = PICM.getFuncFreqMap();
+    auto PIFCPM = PICM.getFuncCondProbMap();
+    auto IsFuncBadPICM = PICM.isFuncBad(F);
+
 
     // Only run on functions that were estimated by the cost model.
     if (LoopVectorizeOptForSize && PIFFM.find(F.getName()) == PIFFM.end())
@@ -2150,7 +2157,7 @@ struct LoopVectorize : public FunctionPass {
         [&](Loop &L) -> const LoopAccessInfo & { return LAA->getInfo(&L); };
 
     return Impl.runImpl(F, *SE, *LI, *TTI, *DT, *BFI, TLI, *DB, *AA, *AC,
-                        GetLAA, *ORE);
+                        GetLAA, *ORE, IsFuncBadPICM);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -6417,8 +6424,19 @@ unsigned LoopVectorizationCostModel::selectInterleaveCount(bool OptForSize,
     IC = PowerOf2Floor((TargetNumRegisters - R.LoopInvariantRegs - 1) /
                        std::max(1U, (R.MaxLocalUsers - 1)));
 
+  // Enable balancing if the corresponding option is enabled.
   if (LoopVectorizeOptForSize) {
-    IC *= LoopVectorizeOptForSize / 100.0;
+    if (PICM) {
+      // 1. If we have model from the partial inlining for the current function,
+      // use it. It was decided by the partial inlining cost model which is the best
+      // ratio here.
+      // Don't try to interleave with an unoptimal function.
+      if (IsFuncBadPICM) return 1;
+    } else {
+      // 2. If we don't have partial inlining heuristics, just apply balancing
+      // according to the ration.
+      IC *= LoopVectorizeOptForSize / 100.0;
+    }
   }
 
   // Clamp the interleave ranges to reasonable counts.
@@ -7658,7 +7676,7 @@ bool LoopVectorizePass::runImpl(
     DominatorTree &DT_, BlockFrequencyInfo &BFI_, TargetLibraryInfo *TLI_,
     DemandedBits &DB_, AliasAnalysis &AA_, AssumptionCache &AC_,
     std::function<const LoopAccessInfo &(Loop &)> &GetLAA_,
-    OptimizationRemarkEmitter &ORE_) {
+    OptimizationRemarkEmitter &ORE_, bool IsFuncBadPICM_) {
 
   SE = &SE_;
   LI = &LI_;
@@ -7671,6 +7689,7 @@ bool LoopVectorizePass::runImpl(
   GetLAA = &GetLAA_;
   DB = &DB_;
   ORE = &ORE_;
+  IsFuncBadPICM = IsFuncBadPICM_;
 
   // Compute some weights outside of the loop over the loops. Compute this
   // using a BranchProbability to re-use its scaling math.
